@@ -162,6 +162,8 @@ class Database:
             'total_bonus': total_bonus
         }
 
+import httpx
+
 # ==================== ASYNC API CLIENT ====================
 class FastCricwayAccount:
     def __init__(self, username: str, password: str, auth_token: str = None, user_id: str = None):
@@ -171,26 +173,26 @@ class FastCricwayAccount:
         self.user_id = user_id
         self.base_url = "https://api.uvwin2024.co"
         self.headers = {
-            'accept': 'application/json',
-            'accept-language': 'en-US,en;q=0.8',
+            'Host': 'api.uvwin2024.co',
+            'Connection': 'keep-alive',
+            'accept': 'application/json, text/plain, */*',
+            'user-agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
             'content-type': 'application/json',
-            'origin': 'https://www.cricway.io',
-            'referer': 'https://www.cricway.io/',
-            'user-agent': 'Mozilla/5.0 (Linux; Android 8.0.0; SM-G955U Build/R16NW) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36',
-            'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Brave";v="146"',
-            'sec-ch-ua-mobile': '?1',
-            'sec-ch-ua-platform': '"Android"',
-            'sec-fetch-dest': 'empty',
-            'sec-fetch-mode': 'cors',
-            'sec-fetch-site': 'cross-site',
             'sec-gpc': '1',
+            'accept-language': 'en-US,en;q=0.9',
+            'origin': 'https://www.cricway.io',
+            'sec-fetch-site': 'cross-site',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-dest': 'empty',
+            'referer': 'https://www.cricway.io/',
+            'accept-encoding': 'gzip, deflate, br',
             'priority': 'u=1, i',
         }
         if self.auth_token:
             self.headers['authorization'] = self.auth_token
     
     async def async_login(self, session: aiohttp.ClientSession) -> Tuple[bool, str]:
-        """Async login using only username and password"""
+        """Async login using httpx for better Cloudflare bypass on Railway"""
         json_data = {
             'username': self.username,
             'password': self.password,
@@ -200,18 +202,23 @@ class FastCricwayAccount:
         
         print(f"🔍 [DEBUG] Attempting login for {self.username} (Credentials only)")
         
-        # Ensure we don't send any old authorization header during login
+        # Fresh login headers (no old auth token)
         login_headers = self.headers.copy()
         if 'authorization' in login_headers:
             del login_headers['authorization']
         
         try:
-            async with session.post(f'{self.base_url}/account/v2/login', 
-                                   headers=login_headers, 
-                                   json=json_data,
-                                   timeout=aiohttp.ClientTimeout(total=10)) as response:
-                status = response.status
-                response_text = await response.text()
+            # Using httpx with HTTP/2 for better TLS fingerprinting (Cloudflare bypass)
+            async with httpx.AsyncClient(http2=True, verify=False) as client:
+                response = await client.post(
+                    f'{self.base_url}/account/v2/login',
+                    headers=login_headers,
+                    json=json_data,
+                    timeout=15.0
+                )
+                
+                status = response.status_code
+                response_text = response.text
                 
                 if status == 200:
                     token = response_text
@@ -232,11 +239,10 @@ class FastCricwayAccount:
                         print(f"✅ [DEBUG] Login success for {self.username}")
                         return True, "Login successful"
                 
-                print(f"❌ [DEBUG] Login failed for {self.username}: HTTP {status} - {response_text[:100]}")
+                print(f"❌ [DEBUG] Login failed for {self.username}: HTTP {status}")
+                if status == 403:
+                    print(f"⚠️ [WARNING] Cloudflare Blocked Railway IP! Response: {response_text[:200]}")
                 return False, f"HTTP {status}"
-        except asyncio.TimeoutError:
-            print(f"❌ [DEBUG] Login timeout for {self.username}")
-            return False, "Timeout"
         except Exception as e:
             print(f"❌ [DEBUG] Login error for {self.username}: {str(e)}")
             return False, str(e)
@@ -376,7 +382,14 @@ class CricwayBot:
                 parse_mode='Markdown'
             )
         else:
-            await update.message.reply_text(f"❌ Failed to add *{username}*: {msg}", parse_mode='Markdown')
+            error_msg = f"❌ Failed to add *{username}*: {msg}"
+            if "403" in msg:
+                error_msg += (
+                    "\n\n⚠️ *Railway IP is Blocked by Cloudflare!*\n"
+                    "Cricway is blocking Railway's servers. I've tried using HTTP/2 to bypass it, "
+                    "but if it still fails, you may need to use a Proxy or run it locally."
+                )
+            await update.message.reply_text(error_msg, parse_mode='Markdown')
     
     async def login_all_accounts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Auto re-login ALL accounts - Main feature"""
