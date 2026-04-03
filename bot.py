@@ -2,7 +2,7 @@ import os
 import json
 import sqlite3
 import asyncio
-import aiohttp
+import httpx
 import time
 from typing import Dict, Optional, Tuple, List
 from datetime import datetime
@@ -191,7 +191,7 @@ class FastCricwayAccount:
         if self.auth_token:
             self.headers['authorization'] = self.auth_token
     
-    async def async_login(self, session: aiohttp.ClientSession) -> Tuple[bool, str]:
+    async def async_login(self, client: httpx.AsyncClient = None) -> Tuple[bool, str]:
         """Async login using httpx for better Cloudflare bypass on Railway"""
         json_data = {
             'username': self.username,
@@ -207,17 +207,36 @@ class FastCricwayAccount:
         if 'authorization' in login_headers:
             del login_headers['authorization']
         
-        try:
-            # Using httpx with HTTP/2 for better TLS fingerprinting (Cloudflare bypass)
-            async with httpx.AsyncClient(http2=True, verify=False) as client:
-                response = await client.post(
+        async def do_login(client_to_use):
+            try:
+                response = await client_to_use.post(
                     f'{self.base_url}/account/v2/login',
                     headers=login_headers,
                     json=json_data,
                     timeout=15.0
                 )
+                return response
+            except Exception as e:
+                raise e
+
+        try:
+            if client:
+                response = await do_login(client)
+            else:
+                # Try using HTTP/2 first for better Cloudflare bypass
+                try:
+                    async with httpx.AsyncClient(http2=True, verify=False) as new_client:
+                        response = await do_login(new_client)
+                except (ImportError, RuntimeError, TypeError) as h2_err:
+                    # Fallback to HTTP/1.1 if h2 is not installed
+                    if "http2" in str(h2_err).lower() or "h2" in str(h2_err).lower():
+                        print(f"⚠️ [WARNING] HTTP/2 not available, falling back to HTTP/1.1: {h2_err}")
+                        async with httpx.AsyncClient(http2=False, verify=False) as new_client:
+                            response = await do_login(new_client)
+                    else:
+                        raise h2_err
                 
-                status = response.status_code
+            status = response.status_code
                 response_text = response.text
                 
                 if status == 200:
@@ -247,24 +266,26 @@ class FastCricwayAccount:
             print(f"❌ [DEBUG] Login error for {self.username}: {str(e)}")
             return False, str(e)
     
-    async def async_get_balance(self, session: aiohttp.ClientSession) -> Tuple[bool, float]:
-        """Async get balance"""
+    async def async_get_balance(self, client: httpx.AsyncClient) -> Tuple[bool, float]:
+        """Async get balance using httpx"""
         if not self.auth_token:
             return False, 0
         
         try:
-            async with session.get(f'{self.base_url}/wallet/v2/wallets/{self.user_id}/balance',
-                                  headers=self.headers,
-                                  timeout=aiohttp.ClientTimeout(total=10)) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return True, float(data.get('balance', 0))
-                return False, 0
+            response = await client.get(
+                f'{self.base_url}/wallet/v2/wallets/{self.user_id}/balance',
+                headers=self.headers,
+                timeout=10.0
+            )
+            if response.status_code == 200:
+                data = response.json()
+                return True, float(data.get('balance', 0))
+            return False, 0
         except:
             return False, 0
     
-    async def async_claim_coupon(self, session: aiohttp.ClientSession, coupon_code: str) -> Tuple[bool, str, float]:
-        """Async claim coupon"""
+    async def async_claim_coupon(self, client: httpx.AsyncClient, coupon_code: str) -> Tuple[bool, str, float]:
+        """Async claim coupon using httpx"""
         if not self.auth_token:
             return False, "Not authenticated", 0
         
@@ -273,38 +294,41 @@ class FastCricwayAccount:
         print(f"🔍 [DEBUG] Claiming coupon for {self.username} | Token: {self.auth_token[:20]}...")
         
         try:
-            async with session.get(f'{self.base_url}/marketing/v1/bonuses/special-bonus',
-                                  headers=self.headers, 
-                                  params=params,
-                                  timeout=aiohttp.ClientTimeout(total=10)) as response:
-                status = response.status
-                response_text = await response.text()
+            response = await client.get(
+                f'{self.base_url}/marketing/v1/bonuses/special-bonus',
+                headers=self.headers, 
+                params=params,
+                timeout=15.0
+            )
+            
+            status = response.status_code
+            response_text = response.text
+            
+            if status == 200:
+                try:
+                    data = json.loads(response_text)
+                    bonus = data.get('data', {}).get('amount', 0)
+                    print(f"✅ [DEBUG] Claim success for {self.username}: ₹{bonus}")
+                    return True, "Success", float(bonus)
+                except:
+                    print(f"✅ [DEBUG] Claim success (Claimed) for {self.username}")
+                    return True, "Claimed", 0
+            else:
+                try:
+                    data = json.loads(response_text)
+                    api_msg = data.get('message', response_text[:100])
+                except:
+                    api_msg = response_text[:100]
                 
-                if status == 200:
-                    try:
-                        data = json.loads(response_text)
-                        bonus = data.get('data', {}).get('amount', 0)
-                        print(f"✅ [DEBUG] Claim success for {self.username}: ₹{bonus}")
-                        return True, "Success", float(bonus)
-                    except:
-                        print(f"✅ [DEBUG] Claim success (Claimed) for {self.username}")
-                        return True, "Claimed", 0
+                if status == 409:
+                    print(f"❌ [DEBUG] Claim failed for {self.username}: Limit exhausted")
+                    return False, "Limit exhausted", 0
+                elif status == 401:
+                    print(f"❌ [DEBUG] Claim failed for {self.username}: Unauthorized (Token expired?)")
+                    return False, f"HTTP {status}", 0
                 else:
-                    try:
-                        data = json.loads(response_text)
-                        api_msg = data.get('message', response_text[:100])
-                    except:
-                        api_msg = response_text[:100]
-                    
-                    if status == 409:
-                        print(f"❌ [DEBUG] Claim failed for {self.username}: Limit exhausted")
-                        return False, "Limit exhausted", 0
-                    elif status == 401:
-                        print(f"❌ [DEBUG] Claim failed for {self.username}: Unauthorized (Token expired?)")
-                        return False, f"HTTP {status}", 0
-                    else:
-                        print(f"❌ [DEBUG] Claim failed for {self.username}: HTTP {status} - {api_msg}")
-                        return False, f"{api_msg}", 0
+                    print(f"❌ [DEBUG] Claim failed for {self.username}: HTTP {status} - {api_msg}")
+                    return False, f"{api_msg}", 0
         except Exception as e:
             print(f"❌ [DEBUG] Claim error for {self.username}: {str(e)}")
             return False, str(e), 0
@@ -370,8 +394,8 @@ class CricwayBot:
         
         # Verify account by logging in
         account = FastCricwayAccount(username, password)
-        async with aiohttp.ClientSession() as session:
-            success, msg = await account.async_login(session)
+        async with httpx.AsyncClient(http2=True, verify=False) as client:
+            success, msg = await account.async_login(client)
         
         if success:
             self.db.add_account(username, password, account.user_id, account.auth_token)
@@ -405,8 +429,8 @@ class CricwayBot:
             await update.message.reply_text("❌ No accounts found! Use /add to add accounts first.")
             return
         
-        async with aiohttp.ClientSession() as session:
-            tasks = [acc.async_login(session) for acc in self.accounts]
+        async with httpx.AsyncClient(http2=True, verify=False) as client:
+            tasks = [acc.async_login(client) for acc in self.accounts]
             results = await asyncio.gather(*tasks)
         
         # Update database with new tokens
@@ -455,20 +479,20 @@ class CricwayBot:
         
         start_time = time.time()
         
-        async with aiohttp.ClientSession() as session:
+        async with httpx.AsyncClient(http2=True, verify=False) as client:
             # Helper to claim with auto-relogin
             async def claim_with_retry(acc: FastCricwayAccount):
-                success, msg, bonus = await acc.async_claim_coupon(session, coupon_code)
+                success, msg, bonus = await acc.async_claim_coupon(client, coupon_code)
                 
                 # If unauthorized, try to login and retry once
                 if not success and "401" in msg:
                     print(f"🔄 [RELOGIN] Token expired for {acc.username}, attempting auto-relogin...")
-                    login_success, login_msg = await acc.async_login(session)
+                    login_success, login_msg = await acc.async_login(client)
                     if login_success:
                         # Update DB with new token
                         self.db.update_account_token(acc.username, acc.auth_token, acc.user_id)
                         # Retry claim
-                        success, msg, bonus = await acc.async_claim_coupon(session, coupon_code)
+                        success, msg, bonus = await acc.async_claim_coupon(client, coupon_code)
                         if success:
                             msg = f"Success (after relogin)"
                         else:
@@ -479,7 +503,7 @@ class CricwayBot:
                 return success, msg, bonus
 
             # Get balances BEFORE
-            balance_tasks = [acc.async_get_balance(session) for acc in self.accounts]
+            balance_tasks = [acc.async_get_balance(client) for acc in self.accounts]
             balances_before = await asyncio.gather(*balance_tasks)
             
             # Claim coupons with auto-retry logic
@@ -487,7 +511,7 @@ class CricwayBot:
             claim_results = await asyncio.gather(*claim_tasks)
             
             # Get balances AFTER
-            balance_after_tasks = [acc.async_get_balance(session) for acc in self.accounts]
+            balance_after_tasks = [acc.async_get_balance(client) for acc in self.accounts]
             balances_after = await asyncio.gather(*balance_after_tasks)
         
         elapsed = time.time() - start_time
@@ -558,8 +582,8 @@ class CricwayBot:
         
         start_time = time.time()
         
-        async with aiohttp.ClientSession() as session:
-            tasks = [acc.async_get_balance(session) for acc in self.accounts]
+        async with httpx.AsyncClient(http2=True, verify=False) as client:
+            tasks = [acc.async_get_balance(client) for acc in self.accounts]
             results = await asyncio.gather(*tasks)
         
         elapsed = time.time() - start_time
@@ -591,8 +615,8 @@ class CricwayBot:
         
         await update.message.reply_text("🔍 Checking login status...")
         
-        async with aiohttp.ClientSession() as session:
-            tasks = [acc.async_get_balance(session) for acc in self.accounts]
+        async with httpx.AsyncClient(http2=True, verify=False) as client:
+            tasks = [acc.async_get_balance(client) for acc in self.accounts]
             results = await asyncio.gather(*tasks)
         
         status_msg = "✅ *Account Status*\n\n"
@@ -632,8 +656,8 @@ class CricwayBot:
         
         await update.message.reply_text(f"🔄 Re-logging *{username}* using credentials...", parse_mode='Markdown')
         
-        async with aiohttp.ClientSession() as session:
-            success, msg = await account.async_login(session)
+        async with httpx.AsyncClient(http2=True, verify=False) as client:
+            success, msg = await account.async_login(client)
         
         if success:
             # Update database with new token and password (if changed)
