@@ -1,4 +1,6 @@
 python-telegram-bot>=22.7
-aiohttp>=3.9.1
 python-dotenv>=1.0.0
-requests>=2.31.0
+httpx>=0.28.1
+h2>=4.1.0
+hpack>=4.0.0
+hyperframe>=6.0.0
