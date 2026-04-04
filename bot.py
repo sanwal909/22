@@ -19,15 +19,13 @@ PROXY_HOST = os.getenv('PROXY_HOST', 'gw.dataimpulse.com')
 PROXY_PORT = os.getenv('PROXY_PORT', '824')
 PROXY_USER = os.getenv('PROXY_USER', '')
 PROXY_PASS = os.getenv('PROXY_PASS', '')
-PROXY_TYPE = os.getenv('PROXY_TYPE', 'http')  # http, socks5, socks4
+PROXY_TYPE = os.getenv('PROXY_TYPE', 'http')
 PROXY_STATE = os.getenv('PROXY_STATE', '')
 
-# Build proxy URL with authentication
 def get_proxy_url():
     if not PROXY_USER or not PROXY_PASS:
         return None
     
-    # Add state/location to username if specified
     username = PROXY_USER
     if PROXY_STATE:
         username = f"{PROXY_USER};state.{PROXY_STATE}"
@@ -41,26 +39,11 @@ PROXY_URL = get_proxy_url()
 
 # ==================== IP CHECK SERVICE ====================
 async def get_current_ip(client: httpx.AsyncClient) -> str:
-    """Get current IP address from proxy"""
     try:
-        # Multiple IP check services
-        services = [
-            "https://api.ipify.org?format=json",
-            "https://httpbin.org/ip",
-            "https://ipapi.co/json/"
-        ]
-        
-        for service in services:
-            try:
-                response = await client.get(service, timeout=5.0)
-                if response.status_code == 200:
-                    data = response.json()
-                    if 'ip' in data:
-                        return data['ip']
-                    elif 'origin' in data:
-                        return data['origin']
-            except:
-                continue
+        response = await client.get("https://api.ipify.org?format=json", timeout=5.0)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get('ip', 'Unknown')
         return "Unknown"
     except Exception as e:
         return f"Error: {str(e)[:30]}"
@@ -108,14 +91,6 @@ class Database:
                 username TEXT,
                 balance REAL,
                 checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS bot_stats (
-                key TEXT PRIMARY KEY,
-                value TEXT,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
@@ -205,25 +180,18 @@ class FastCricwayAccount:
         self.last_ip = None
         self.base_url = "https://api.uvwin2024.co"
         self.headers = {
-            'Host': 'api.uvwin2024.co',
-            'Connection': 'keep-alive',
             'accept': 'application/json, text/plain, */*',
-            'user-agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
             'content-type': 'application/json',
-            'sec-gpc': '1',
-            'accept-language': 'en-US,en;q=0.9',
             'origin': 'https://www.cricway.io',
-            'sec-fetch-site': 'cross-site',
-            'sec-fetch-mode': 'cors',
-            'sec-fetch-dest': 'empty',
             'referer': 'https://www.cricway.io/',
-            'accept-encoding': 'gzip, deflate, br',
-            'priority': 'u=1, i',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'accept-language': 'en-US,en;q=0.9',
         }
         if self.auth_token:
             self.headers['authorization'] = self.auth_token
     
     async def async_login(self, client: httpx.AsyncClient = None) -> Tuple[bool, str]:
+        """Async login with full debugging"""
         json_data = {
             'username': self.username,
             'password': self.password,
@@ -231,60 +199,154 @@ class FastCricwayAccount:
             'loginRequestType': 'PHONE_SIGN_IN',
         }
         
-        print(f"🔍 [DEBUG] Attempting login for {self.username}")
+        print(f"\n{'='*60}")
+        print(f"🔍 [DEBUG] LOGIN ATTEMPT for: {self.username}")
+        print(f"{'='*60}")
+        print(f"📝 Request Data: {json.dumps(json_data, indent=2)}")
         
         login_headers = self.headers.copy()
         if 'authorization' in login_headers:
             del login_headers['authorization']
         
-        async def do_login(client_to_use):
-            response = await client_to_use.post(
-                f'{self.base_url}/account/v2/login',
-                headers=login_headers,
-                json=json_data,
-                timeout=15.0
-            )
-            return response
-
+        print(f"📋 Headers being sent: {json.dumps(login_headers, indent=2)}")
+        
         try:
-            if client:
-                response = await do_login(client)
-                # Get IP from proxy
-                self.last_ip = await get_current_ip(client)
+            # Create client if not provided
+            if client is None:
+                print(f"🔧 Creating new HTTPX client with proxy: {PROXY_URL if PROXY_URL else 'None'}")
+                async with httpx.AsyncClient(
+                    http2=True, 
+                    verify=False, 
+                    proxy=PROXY_URL,
+                    timeout=30.0,
+                    follow_redirects=True
+                ) as new_client:
+                    return await self._do_login(new_client, json_data, login_headers)
             else:
-                async with httpx.AsyncClient(http2=True, verify=False, proxy=PROXY_URL) as new_client:
-                    response = await do_login(new_client)
-                    self.last_ip = await get_current_ip(new_client)
-            
-            status = response.status_code
-            response_text = response.text
+                return await self._do_login(client, json_data, login_headers)
                 
-            if status == 200:
-                token = response_text.strip()
-                if token.startswith('eyJ'):
-                    self.auth_token = token
-                    self.headers['authorization'] = self.auth_token
-                    
-                    import base64
-                    token_parts = token.split('.')
-                    if len(token_parts) > 1:
-                        payload = token_parts[1]
-                        payload += '=' * (4 - len(payload) % 4)
-                        decoded = base64.b64decode(payload).decode('utf-8')
-                        token_data = json.loads(decoded)
-                        self.user_id = str(token_data.get('uid', token_data.get('userId', '')))
-                    
-                    print(f"✅ [DEBUG] Login success for {self.username} (IP: {self.last_ip})")
-                    return True, "Login successful"
+        except Exception as e:
+            print(f"❌ [DEBUG] Exception: {type(e).__name__}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return False, f"Exception: {str(e)}"
+    
+    async def _do_login(self, client: httpx.AsyncClient, json_data: dict, headers: dict) -> Tuple[bool, str]:
+        """Execute login request"""
+        url = f'{self.base_url}/account/v2/login'
+        print(f"🌐 Request URL: {url}")
+        
+        try:
+            response = await client.post(url, headers=headers, json=json_data)
             
-            print(f"❌ [DEBUG] Login failed for {self.username}: HTTP {status}")
-            if status == 403:
-                print(f"⚠️ [WARNING] Blocked! IP: {self.last_ip}")
-            return False, f"HTTP {status}"
+            print(f"\n📡 RESPONSE DETAILS:")
+            print(f"   Status Code: {response.status_code}")
+            print(f"   HTTP Version: {response.http_version}")
+            print(f"   Headers: {dict(response.headers)}")
+            
+            # Get response text
+            response_text = response.text
+            print(f"   Response Body (first 500 chars): {response_text[:500]}")
+            
+            # Handle different status codes
+            if response.status_code == 200:
+                # Try to parse as JSON first
+                try:
+                    data = response.json()
+                    print(f"   ✅ Parsed as JSON: {json.dumps(data, indent=2)[:500]}")
+                    
+                    # Check if response contains token
+                    if isinstance(data, dict):
+                        if 'data' in data and 'token' in data['data']:
+                            token = data['data']['token']
+                            print(f"   ✅ Token found in data.data.token")
+                            return self._process_token(token)
+                        elif 'token' in data:
+                            token = data['token']
+                            print(f"   ✅ Token found in data.token")
+                            return self._process_token(token)
+                        elif 'access_token' in data:
+                            token = data['access_token']
+                            print(f"   ✅ Token found in data.access_token")
+                            return self._process_token(token)
+                    
+                    # If it's a plain string
+                    if isinstance(data, str) and data.startswith('eyJ'):
+                        print(f"   ✅ Response is raw JWT token")
+                        return self._process_token(data)
+                        
+                except json.JSONDecodeError:
+                    # Not JSON - check if it's raw JWT
+                    if response_text.strip().startswith('eyJ'):
+                        print(f"   ✅ Raw response is JWT token")
+                        return self._process_token(response_text.strip())
+                    else:
+                        print(f"   ❌ Response is not JSON and not JWT")
+                        return False, f"Unexpected response format: {response_text[:200]}"
+            
+            elif response.status_code == 400:
+                print(f"   ❌ Bad Request")
+                try:
+                    error_data = response.json()
+                    return False, f"Bad Request: {error_data.get('message', response_text[:100])}"
+                except:
+                    return False, f"Bad Request: {response_text[:100]}"
+            
+            elif response.status_code == 401:
+                print(f"   ❌ Unauthorized - Invalid credentials")
+                return False, "Invalid username or password"
+            
+            elif response.status_code == 403:
+                print(f"   ❌ Forbidden - Cloudflare blocking")
+                # Get proxy IP for debugging
+                try:
+                    ip_response = await client.get("https://api.ipify.org?format=json", timeout=5.0)
+                    if ip_response.status_code == 200:
+                        ip_data = ip_response.json()
+                        print(f"   🌍 Current proxy IP: {ip_data.get('ip', 'Unknown')}")
+                except:
+                    pass
+                return False, "HTTP 403 - Cloudflare is blocking this IP. Try different proxy location."
+            
+            else:
+                print(f"   ❌ Unexpected status code")
+                return False, f"HTTP {response.status_code}: {response_text[:200]}"
+                
+        except httpx.TimeoutException:
+            print(f"   ❌ Timeout error")
+            return False, "Request timeout - Server not responding"
+        except httpx.ConnectError as e:
+            print(f"   ❌ Connection error: {e}")
+            return False, f"Connection error: {str(e)[:100]}"
+        except Exception as e:
+            print(f"   ❌ Unknown error: {type(e).__name__}: {e}")
+            return False, f"Error: {str(e)[:100]}"
+    
+    def _process_token(self, token: str) -> Tuple[bool, str]:
+        """Process JWT token and extract user info"""
+        try:
+            self.auth_token = token
+            self.headers['authorization'] = self.auth_token
+            
+            # Extract user_id from JWT token
+            import base64
+            token_parts = token.split('.')
+            if len(token_parts) > 1:
+                payload = token_parts[1]
+                # Add padding if needed
+                payload += '=' * (4 - len(payload) % 4)
+                decoded = base64.b64decode(payload).decode('utf-8')
+                token_data = json.loads(decoded)
+                self.user_id = str(token_data.get('uid', token_data.get('userId', token_data.get('sub', ''))))
+                print(f"   📍 Extracted User ID: {self.user_id}")
+                print(f"   📍 Token payload: {json.dumps(token_data, indent=2)[:300]}")
+            
+            print(f"✅ [DEBUG] Login SUCCESS for {self.username}")
+            return True, "Login successful"
             
         except Exception as e:
-            print(f"❌ [DEBUG] Login error for {self.username}: {str(e)}")
-            return False, str(e)
+            print(f"❌ Token processing error: {e}")
+            return False, f"Token processing failed: {str(e)}"
     
     async def async_get_balance(self, client: httpx.AsyncClient) -> Tuple[bool, float]:
         if not self.auth_token:
@@ -318,11 +380,10 @@ class FastCricwayAccount:
             )
             
             status = response.status_code
-            response_text = response.text
             
             if status == 200:
                 try:
-                    data = json.loads(response_text)
+                    data = response.json()
                     bonus = data.get('data', {}).get('amount', 0)
                     return True, "Success", float(bonus)
                 except:
@@ -359,15 +420,16 @@ class CricwayBot:
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         stats = self.db.get_stats()
         
-        # Show proxy status
         proxy_status = "✅ Active" if PROXY_URL else "❌ Not Configured"
-        proxy_ip = "Checking..."
         
-        try:
-            async with httpx.AsyncClient(proxy=PROXY_URL, verify=False) as client:
-                proxy_ip = await get_current_ip(client)
-        except:
-            proxy_ip = "Failed to fetch"
+        # Test proxy connection
+        proxy_ip = "Checking..."
+        if PROXY_URL:
+            try:
+                async with httpx.AsyncClient(proxy=PROXY_URL, verify=False, timeout=10.0) as client:
+                    proxy_ip = await get_current_ip(client)
+            except:
+                proxy_ip = "Failed to connect"
         
         welcome_msg = f"""
 🚀 *CRICWAY PROXY BOT* 🚀
@@ -381,7 +443,6 @@ class CricwayBot:
 👥 Accounts: {stats['total_accounts']}
 📊 Today Claims: {stats['today_claims']}
 💰 Today Bonus: ₹{stats['today_bonus']:.2f}
-💎 Total Bonus: ₹{stats['total_bonus']:.2f}
 
 *Commands:*
 🔐 `/add username password` - Add account
@@ -396,37 +457,12 @@ class CricwayBot:
         await update.message.reply_text(welcome_msg, parse_mode='Markdown')
     
     async def show_ip(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show current proxy IP"""
         await update.message.reply_text("🌍 Checking proxy IP...")
         
         try:
-            async with httpx.AsyncClient(proxy=PROXY_URL, verify=False) as client:
+            async with httpx.AsyncClient(proxy=PROXY_URL, verify=False, timeout=10.0) as client:
                 ip = await get_current_ip(client)
-                
-                # Get detailed location info
-                try:
-                    response = await client.get("https://ipapi.co/json/", timeout=5.0)
-                    if response.status_code == 200:
-                        details = response.json()
-                        location_msg = f"""
-🌍 *Proxy Information*
-
-📡 *IP Address:* `{ip}`
-📍 *Country:* {details.get('country_name', 'Unknown')}
-🏙️ *City:* {details.get('city', 'Unknown')}
-🗺️ *Region:* {details.get('region', 'Unknown')}
-📮 *Postal:* {details.get('postal', 'Unknown')}
-📱 *ISP:* {details.get('org', 'Unknown')}
-🔌 *Proxy Type:* {PROXY_TYPE.upper()}
-
-✅ *Proxy is working correctly!*
-                        """
-                    else:
-                        location_msg = f"🌍 Proxy IP: `{ip}`"
-                except:
-                    location_msg = f"🌍 Proxy IP: `{ip}`"
-                
-                await update.message.reply_text(location_msg, parse_mode='Markdown')
+                await update.message.reply_text(f"🌍 Current Proxy IP: `{ip}`", parse_mode='Markdown')
         except Exception as e:
             await update.message.reply_text(f"❌ Failed to get proxy IP: {str(e)}")
     
@@ -438,30 +474,39 @@ class CricwayBot:
         
         username, password = args[0], args[1]
         
-        await update.message.reply_text(f"🔐 Verifying account *{username}* via proxy...", parse_mode='Markdown')
+        await update.message.reply_text(f"🔐 Verifying account *{username}* via proxy...\n⏳ Please wait...", parse_mode='Markdown')
         
         account = FastCricwayAccount(username, password)
         
         try:
-            async with httpx.AsyncClient(http2=True, verify=False, proxy=PROXY_URL) as client:
+            async with httpx.AsyncClient(
+                http2=True, 
+                verify=False, 
+                proxy=PROXY_URL,
+                timeout=30.0,
+                follow_redirects=True
+            ) as client:
                 # Get proxy IP first
                 proxy_ip = await get_current_ip(client)
+                print(f"🌍 Using proxy IP: {proxy_ip}")
+                
                 success, msg = await account.async_login(client)
             
             if success:
                 self.db.add_account(username, password, account.user_id, account.auth_token, proxy_ip)
                 self.load_accounts()
                 await update.message.reply_text(
-                    f"✅ Account *{username}* added!\n"
-                    f"🆔 ID: {account.user_id}\n"
+                    f"✅ Account *{username}* added successfully!\n"
+                    f"🆔 User ID: `{account.user_id}`\n"
                     f"🌍 Login IP: `{proxy_ip}`",
                     parse_mode='Markdown'
                 )
             else:
-                error_msg = f"❌ Failed: {msg}"
+                error_msg = f"❌ Failed to add *{username}*\n\nReason: `{msg}`"
                 await update.message.reply_text(error_msg, parse_mode='Markdown')
+                
         except Exception as e:
-            await update.message.reply_text(f"❌ Error: {str(e)}")
+            await update.message.reply_text(f"❌ Error: `{str(e)}`", parse_mode='Markdown')
     
     async def login_all_accounts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.accounts:
@@ -469,26 +514,17 @@ class CricwayBot:
             return
         
         await update.message.reply_text(f"🔄 Re-logging {len(self.accounts)} accounts via proxy...")
-        start_time = time.time()
         
-        async with httpx.AsyncClient(http2=True, verify=False, proxy=PROXY_URL) as client:
-            # Get proxy IP first
+        async with httpx.AsyncClient(http2=True, verify=False, proxy=PROXY_URL, timeout=30.0) as client:
             proxy_ip = await get_current_ip(client)
             
             tasks = [acc.async_login(client) for acc in self.accounts]
             results = await asyncio.gather(*tasks)
         
-        success_count = 0
-        for acc, (success, msg) in zip(self.accounts, results):
-            if success:
-                self.db.update_account_token(acc.username, acc.auth_token, acc.user_id, proxy_ip)
-                success_count += 1
-        
-        elapsed = time.time() - start_time
+        success_count = sum(1 for r in results if r[0])
         
         result_msg = f"✅ *Login Complete!*\n"
         result_msg += f"🌍 Proxy IP: `{proxy_ip}`\n"
-        result_msg += f"⏱️ Time: {elapsed:.2f}s\n"
         result_msg += f"📊 Success: {success_count}/{len(self.accounts)}"
         
         await update.message.reply_text(result_msg, parse_mode='Markdown')
@@ -505,10 +541,9 @@ class CricwayBot:
             await update.message.reply_text("❌ No accounts found!")
             return
         
-        await update.message.reply_text(f"⚡ Claiming *{coupon_code}* for {len(self.accounts)} accounts via proxy...")
-        start_time = time.time()
+        await update.message.reply_text(f"⚡ Claiming *{coupon_code}* for {len(self.accounts)} accounts...")
         
-        async with httpx.AsyncClient(http2=True, verify=False, proxy=PROXY_URL) as client:
+        async with httpx.AsyncClient(http2=True, verify=False, proxy=PROXY_URL, timeout=30.0) as client:
             proxy_ip = await get_current_ip(client)
             
             # Get balances before
@@ -523,12 +558,10 @@ class CricwayBot:
             balance_after_tasks = [acc.async_get_balance(client) for acc in self.accounts]
             balances_after = await asyncio.gather(*balance_after_tasks)
         
-        elapsed = time.time() - start_time
-        
         success_count = sum(1 for r in claim_results if r[0])
         total_bonus = sum(r[2] for r in claim_results if r[0])
         
-        # Save to database with proxy IP
+        # Save to database
         for i, acc in enumerate(self.accounts):
             if claim_results[i][0]:
                 self.db.save_coupon_claim(
@@ -541,7 +574,6 @@ class CricwayBot:
         
         result_msg = f"🎫 *{coupon_code}*\n"
         result_msg += f"🌍 Proxy IP: `{proxy_ip}`\n"
-        result_msg += f"⚡ Time: {elapsed:.2f}s\n"
         result_msg += f"📊 Success: {success_count}/{len(self.accounts)}\n"
         result_msg += f"💰 Total Bonus: ₹{total_bonus:.2f}"
         
@@ -552,9 +584,9 @@ class CricwayBot:
             await update.message.reply_text("❌ No accounts found!")
             return
         
-        await update.message.reply_text("💰 Fetching balances via proxy...")
+        await update.message.reply_text("💰 Fetching balances...")
         
-        async with httpx.AsyncClient(http2=True, verify=False, proxy=PROXY_URL) as client:
+        async with httpx.AsyncClient(http2=True, verify=False, proxy=PROXY_URL, timeout=30.0) as client:
             tasks = [acc.async_get_balance(client) for acc in self.accounts]
             results = await asyncio.gather(*tasks)
         
@@ -576,9 +608,9 @@ class CricwayBot:
             await update.message.reply_text("❌ No accounts found!")
             return
         
-        await update.message.reply_text("🔍 Checking login status via proxy...")
+        await update.message.reply_text("🔍 Checking login status...")
         
-        async with httpx.AsyncClient(http2=True, verify=False, proxy=PROXY_URL) as client:
+        async with httpx.AsyncClient(http2=True, verify=False, proxy=PROXY_URL, timeout=30.0) as client:
             tasks = [acc.async_get_balance(client) for acc in self.accounts]
             results = await asyncio.gather(*tasks)
         
@@ -626,17 +658,15 @@ def main():
         print("❌ BOT_TOKEN not found!")
         return
     
-    # Print proxy configuration on startup
-    print("=" * 50)
-    print("🚀 CRICWAY PROXY BOT")
-    print("=" * 50)
-    if PROXY_URL:
-        print(f"✅ Proxy: {PROXY_TYPE.upper()}://{PROXY_HOST}:{PROXY_PORT}")
-        print(f"📍 Location: {PROXY_STATE or 'Auto'}")
-        print(f"👤 Username: {PROXY_USER[:20]}...")
-    else:
-        print("⚠️ No proxy configured!")
-    print("=" * 50)
+    # Print configuration
+    print("\n" + "="*60)
+    print("🚀 CRICWAY PROXY BOT STARTING")
+    print("="*60)
+    print(f"🤖 Bot Token: {BOT_TOKEN[:10]}...")
+    print(f"🔐 Proxy: {PROXY_TYPE.upper()}://{PROXY_HOST}:{PROXY_PORT}")
+    print(f"📍 State: {PROXY_STATE or 'Auto'}")
+    print(f"👤 Username: {PROXY_USER[:30]}...")
+    print("="*60 + "\n")
     
     bot = CricwayBot()
     app = Application.builder().token(BOT_TOKEN).build()
@@ -649,11 +679,10 @@ def main():
     app.add_handler(CommandHandler("check", bot.check_status))
     app.add_handler(CommandHandler("stats", bot.stats))
     app.add_handler(CommandHandler("remove", bot.remove_account))
-    app.add_handler(CommandHandler("ip", bot.show_ip))  # New command to show proxy IP
+    app.add_handler(CommandHandler("ip", bot.show_ip))
     
     print("🚀 Bot is starting...")
-    print(f"📊 Loaded {len(bot.accounts)} accounts")
-    print("✅ Bot is ready!")
+    print("✅ Bot is ready!\n")
     
     app.run_polling()
 
