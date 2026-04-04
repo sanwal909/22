@@ -10,6 +10,9 @@ from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
+from asyncio import Semaphore
 
 # Load environment variables
 load_dotenv()
@@ -25,30 +28,16 @@ PROXY_STATE = os.getenv('PROXY_STATE', '')
 def get_proxy_url():
     if not PROXY_USER or not PROXY_PASS:
         return None
-    
     username = PROXY_USER
     if PROXY_STATE:
         username = f"{PROXY_USER};state.{PROXY_STATE}"
-    
     encoded_user = urllib.parse.quote(username)
     encoded_pass = urllib.parse.quote(PROXY_PASS)
-    
     return f"{PROXY_TYPE}://{encoded_user}:{encoded_pass}@{PROXY_HOST}:{PROXY_PORT}"
 
 PROXY_URL = get_proxy_url()
 
-# ==================== IP CHECK SERVICE ====================
-async def get_current_ip(client: httpx.AsyncClient) -> str:
-    try:
-        response = await client.get("https://api.ipify.org?format=json", timeout=5.0)
-        if response.status_code == 200:
-            data = response.json()
-            return data.get('ip', 'Unknown')
-        return "Unknown"
-    except Exception as e:
-        return f"Error: {str(e)[:30]}"
-
-# ==================== DATABASE SETUP ====================
+# ==================== DATABASE ====================
 class Database:
     def __init__(self):
         db_path = os.getenv('DATABASE_PATH', 'data/cricway.db')
@@ -65,6 +54,7 @@ class Database:
                 user_id TEXT,
                 auth_token TEXT,
                 last_ip TEXT,
+                balance REAL DEFAULT 0,
                 is_active BOOLEAN DEFAULT 1,
                 last_login TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -96,12 +86,12 @@ class Database:
         
         self.conn.commit()
     
-    def add_account(self, username: str, password: str, user_id: str = None, auth_token: str = None, last_ip: str = None) -> bool:
+    def add_account(self, username: str, password: str, user_id: str = None, auth_token: str = None, last_ip: str = None, balance: float = 0) -> bool:
         try:
             cursor = self.conn.cursor()
             cursor.execute(
-                "INSERT OR REPLACE INTO accounts (username, password, user_id, auth_token, last_ip, is_active, last_login) VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)",
-                (username, password, user_id, auth_token, last_ip)
+                "INSERT OR REPLACE INTO accounts (username, password, user_id, auth_token, last_ip, balance, is_active, last_login) VALUES (?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)",
+                (username, password, user_id, auth_token, last_ip, balance)
             )
             self.conn.commit()
             return True
@@ -111,7 +101,7 @@ class Database:
     
     def get_all_accounts(self) -> List[Dict]:
         cursor = self.conn.cursor()
-        cursor.execute("SELECT username, password, user_id, auth_token, last_ip, is_active FROM accounts WHERE is_active = 1")
+        cursor.execute("SELECT username, password, user_id, auth_token, last_ip, balance, is_active FROM accounts WHERE is_active = 1")
         rows = cursor.fetchall()
         return [
             {
@@ -120,24 +110,35 @@ class Database:
                 "user_id": row[2],
                 "auth_token": row[3],
                 "last_ip": row[4],
-                "is_active": bool(row[5])
+                "balance": row[5] or 0,
+                "is_active": bool(row[6])
             }
             for row in rows
         ]
     
-    def update_account_token(self, username: str, auth_token: str, user_id: str, last_ip: str = None):
+    def update_account(self, username: str, auth_token: str = None, user_id: str = None, last_ip: str = None, balance: float = None):
         cursor = self.conn.cursor()
+        updates = []
+        params = []
+        
+        if auth_token:
+            updates.append("auth_token = ?")
+            params.append(auth_token)
+        if user_id:
+            updates.append("user_id = ?")
+            params.append(user_id)
         if last_ip:
-            cursor.execute(
-                "UPDATE accounts SET auth_token = ?, user_id = ?, last_ip = ?, last_login = CURRENT_TIMESTAMP WHERE username = ?",
-                (auth_token, user_id, last_ip, username)
-            )
-        else:
-            cursor.execute(
-                "UPDATE accounts SET auth_token = ?, user_id = ?, last_login = CURRENT_TIMESTAMP WHERE username = ?",
-                (auth_token, user_id, username)
-            )
-        self.conn.commit()
+            updates.append("last_ip = ?")
+            params.append(last_ip)
+        if balance is not None:
+            updates.append("balance = ?")
+            params.append(balance)
+        
+        if updates:
+            updates.append("last_login = CURRENT_TIMESTAMP")
+            params.append(username)
+            cursor.execute(f"UPDATE accounts SET {', '.join(updates)} WHERE username = ?", params)
+            self.conn.commit()
     
     def save_coupon_claim(self, username: str, coupon_code: str, status: str, bonus: float, balance_before: float, balance_after: float, proxy_ip: str = None):
         cursor = self.conn.cursor()
@@ -146,11 +147,11 @@ class Database:
             (username, coupon_code, status, bonus, balance_before, balance_after, proxy_ip)
         )
         self.conn.commit()
-    
-    def delete_account(self, username: str):
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM accounts WHERE username = ?", (username,))
-        self.conn.commit()
+        
+        # Update account balance
+        if status == "SUCCESS":
+            cursor.execute("UPDATE accounts SET balance = ? WHERE username = ?", (balance_after, username))
+            self.conn.commit()
     
     def get_stats(self) -> Dict:
         cursor = self.conn.cursor()
@@ -162,36 +163,38 @@ class Database:
         today_bonus = cursor.fetchone()[0] or 0
         cursor.execute("SELECT COUNT(*), SUM(bonus) FROM coupon_history WHERE status = 'SUCCESS'")
         total_claims, total_bonus = cursor.fetchone()
+        cursor.execute("SELECT SUM(balance) FROM accounts WHERE is_active = 1")
+        total_balance = cursor.fetchone()[0] or 0
         return {
             'total_accounts': total_accounts,
             'today_claims': today_claims,
             'today_bonus': today_bonus,
             'total_claims': total_claims or 0,
-            'total_bonus': total_bonus or 0
+            'total_bonus': total_bonus or 0,
+            'total_balance': total_balance
         }
 
-# ==================== ASYNC API CLIENT ====================
+# ==================== FAST API CLIENT ====================
 class FastCricwayAccount:
     def __init__(self, username: str, password: str, auth_token: str = None, user_id: str = None):
         self.username = username
         self.password = password
         self.auth_token = auth_token
         self.user_id = user_id
-        self.last_ip = None
+        self.balance = 0
         self.base_url = "https://api.uvwin2024.co"
         self.headers = {
-            'accept': 'application/json, text/plain, */*',
+            'accept': 'application/json',
             'content-type': 'application/json',
             'origin': 'https://www.cricway.io',
             'referer': 'https://www.cricway.io/',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'accept-language': 'en-US,en;q=0.9',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         }
         if self.auth_token:
             self.headers['authorization'] = self.auth_token
     
-    async def async_login(self, client: httpx.AsyncClient = None) -> Tuple[bool, str]:
-        """Async login with full debugging"""
+    async def fast_login(self, client: httpx.AsyncClient) -> Tuple[bool, str]:
+        """Fast login - returns token and user_id"""
         json_data = {
             'username': self.username,
             'password': self.password,
@@ -199,156 +202,41 @@ class FastCricwayAccount:
             'loginRequestType': 'PHONE_SIGN_IN',
         }
         
-        print(f"\n{'='*60}")
-        print(f"🔍 [DEBUG] LOGIN ATTEMPT for: {self.username}")
-        print(f"{'='*60}")
-        print(f"📝 Request Data: {json.dumps(json_data, indent=2)}")
-        
         login_headers = self.headers.copy()
         if 'authorization' in login_headers:
             del login_headers['authorization']
         
-        print(f"📋 Headers being sent: {json.dumps(login_headers, indent=2)}")
-        
         try:
-            # Create client if not provided
-            if client is None:
-                print(f"🔧 Creating new HTTPX client with proxy: {PROXY_URL if PROXY_URL else 'None'}")
-                async with httpx.AsyncClient(
-                    http2=True, 
-                    verify=False, 
-                    proxy=PROXY_URL,
-                    timeout=30.0,
-                    follow_redirects=True
-                ) as new_client:
-                    return await self._do_login(new_client, json_data, login_headers)
-            else:
-                return await self._do_login(client, json_data, login_headers)
-                
-        except Exception as e:
-            print(f"❌ [DEBUG] Exception: {type(e).__name__}: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return False, f"Exception: {str(e)}"
-    
-    async def _do_login(self, client: httpx.AsyncClient, json_data: dict, headers: dict) -> Tuple[bool, str]:
-        """Execute login request"""
-        url = f'{self.base_url}/account/v2/login'
-        print(f"🌐 Request URL: {url}")
-        
-        try:
-            response = await client.post(url, headers=headers, json=json_data)
+            response = await client.post(
+                f'{self.base_url}/account/v2/login',
+                headers=login_headers,
+                json=json_data,
+                timeout=10.0
+            )
             
-            print(f"\n📡 RESPONSE DETAILS:")
-            print(f"   Status Code: {response.status_code}")
-            print(f"   HTTP Version: {response.http_version}")
-            print(f"   Headers: {dict(response.headers)}")
-            
-            # Get response text
-            response_text = response.text
-            print(f"   Response Body (first 500 chars): {response_text[:500]}")
-            
-            # Handle different status codes
             if response.status_code == 200:
-                # Try to parse as JSON first
-                try:
-                    data = response.json()
-                    print(f"   ✅ Parsed as JSON: {json.dumps(data, indent=2)[:500]}")
+                token = response.text.strip()
+                if token.startswith('eyJ'):
+                    self.auth_token = token
+                    self.headers['authorization'] = self.auth_token
                     
-                    # Check if response contains token
-                    if isinstance(data, dict):
-                        if 'data' in data and 'token' in data['data']:
-                            token = data['data']['token']
-                            print(f"   ✅ Token found in data.data.token")
-                            return self._process_token(token)
-                        elif 'token' in data:
-                            token = data['token']
-                            print(f"   ✅ Token found in data.token")
-                            return self._process_token(token)
-                        elif 'access_token' in data:
-                            token = data['access_token']
-                            print(f"   ✅ Token found in data.access_token")
-                            return self._process_token(token)
+                    # Extract user_id from JWT
+                    import base64
+                    token_parts = token.split('.')
+                    if len(token_parts) > 1:
+                        payload = token_parts[1]
+                        payload += '=' * (4 - len(payload) % 4)
+                        decoded = base64.b64decode(payload).decode('utf-8')
+                        token_data = json.loads(decoded)
+                        self.user_id = str(token_data.get('uid', token_data.get('userId', '')))
                     
-                    # If it's a plain string
-                    if isinstance(data, str) and data.startswith('eyJ'):
-                        print(f"   ✅ Response is raw JWT token")
-                        return self._process_token(data)
-                        
-                except json.JSONDecodeError:
-                    # Not JSON - check if it's raw JWT
-                    if response_text.strip().startswith('eyJ'):
-                        print(f"   ✅ Raw response is JWT token")
-                        return self._process_token(response_text.strip())
-                    else:
-                        print(f"   ❌ Response is not JSON and not JWT")
-                        return False, f"Unexpected response format: {response_text[:200]}"
-            
-            elif response.status_code == 400:
-                print(f"   ❌ Bad Request")
-                try:
-                    error_data = response.json()
-                    return False, f"Bad Request: {error_data.get('message', response_text[:100])}"
-                except:
-                    return False, f"Bad Request: {response_text[:100]}"
-            
-            elif response.status_code == 401:
-                print(f"   ❌ Unauthorized - Invalid credentials")
-                return False, "Invalid username or password"
-            
-            elif response.status_code == 403:
-                print(f"   ❌ Forbidden - Cloudflare blocking")
-                # Get proxy IP for debugging
-                try:
-                    ip_response = await client.get("https://api.ipify.org?format=json", timeout=5.0)
-                    if ip_response.status_code == 200:
-                        ip_data = ip_response.json()
-                        print(f"   🌍 Current proxy IP: {ip_data.get('ip', 'Unknown')}")
-                except:
-                    pass
-                return False, "HTTP 403 - Cloudflare is blocking this IP. Try different proxy location."
-            
-            else:
-                print(f"   ❌ Unexpected status code")
-                return False, f"HTTP {response.status_code}: {response_text[:200]}"
-                
-        except httpx.TimeoutException:
-            print(f"   ❌ Timeout error")
-            return False, "Request timeout - Server not responding"
-        except httpx.ConnectError as e:
-            print(f"   ❌ Connection error: {e}")
-            return False, f"Connection error: {str(e)[:100]}"
+                    return True, "Login successful"
+            return False, f"HTTP {response.status_code}"
         except Exception as e:
-            print(f"   ❌ Unknown error: {type(e).__name__}: {e}")
-            return False, f"Error: {str(e)[:100]}"
+            return False, str(e)
     
-    def _process_token(self, token: str) -> Tuple[bool, str]:
-        """Process JWT token and extract user info"""
-        try:
-            self.auth_token = token
-            self.headers['authorization'] = self.auth_token
-            
-            # Extract user_id from JWT token
-            import base64
-            token_parts = token.split('.')
-            if len(token_parts) > 1:
-                payload = token_parts[1]
-                # Add padding if needed
-                payload += '=' * (4 - len(payload) % 4)
-                decoded = base64.b64decode(payload).decode('utf-8')
-                token_data = json.loads(decoded)
-                self.user_id = str(token_data.get('uid', token_data.get('userId', token_data.get('sub', ''))))
-                print(f"   📍 Extracted User ID: {self.user_id}")
-                print(f"   📍 Token payload: {json.dumps(token_data, indent=2)[:300]}")
-            
-            print(f"✅ [DEBUG] Login SUCCESS for {self.username}")
-            return True, "Login successful"
-            
-        except Exception as e:
-            print(f"❌ Token processing error: {e}")
-            return False, f"Token processing failed: {str(e)}"
-    
-    async def async_get_balance(self, client: httpx.AsyncClient) -> Tuple[bool, float]:
+    async def fast_balance(self, client: httpx.AsyncClient) -> Tuple[bool, float]:
+        """Fast balance check"""
         if not self.auth_token:
             return False, 0
         
@@ -356,16 +244,18 @@ class FastCricwayAccount:
             response = await client.get(
                 f'{self.base_url}/wallet/v2/wallets/{self.user_id}/balance',
                 headers=self.headers,
-                timeout=10.0
+                timeout=8.0
             )
             if response.status_code == 200:
                 data = response.json()
-                return True, float(data.get('balance', 0))
+                self.balance = float(data.get('balance', 0))
+                return True, self.balance
             return False, 0
         except:
             return False, 0
     
-    async def async_claim_coupon(self, client: httpx.AsyncClient, coupon_code: str) -> Tuple[bool, str, float]:
+    async def fast_claim(self, client: httpx.AsyncClient, coupon_code: str) -> Tuple[bool, str, float]:
+        """Fast coupon claim"""
         if not self.auth_token:
             return False, "Not authenticated", 0
         
@@ -374,34 +264,31 @@ class FastCricwayAccount:
         try:
             response = await client.get(
                 f'{self.base_url}/marketing/v1/bonuses/special-bonus',
-                headers=self.headers, 
+                headers=self.headers,
                 params=params,
-                timeout=15.0
+                timeout=8.0
             )
             
-            status = response.status_code
-            
-            if status == 200:
+            if response.status_code == 200:
                 try:
                     data = response.json()
                     bonus = data.get('data', {}).get('amount', 0)
                     return True, "Success", float(bonus)
                 except:
                     return True, "Claimed", 0
-            elif status == 409:
+            elif response.status_code == 409:
                 return False, "Limit exhausted", 0
-            elif status == 401:
-                return False, "Unauthorized", 0
             else:
-                return False, f"HTTP {status}", 0
+                return False, f"HTTP {response.status_code}", 0
         except Exception as e:
             return False, str(e), 0
 
-# ==================== TELEGRAM BOT ====================
-class CricwayBot:
+# ==================== ULTRA FAST BOT ====================
+class UltraFastBot:
     def __init__(self):
         self.db = Database()
         self.accounts = []
+        self.semaphore = Semaphore(50)  # Max 50 concurrent requests
         self.load_accounts()
     
     def load_accounts(self):
@@ -420,51 +307,28 @@ class CricwayBot:
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         stats = self.db.get_stats()
         
-        proxy_status = "✅ Active" if PROXY_URL else "❌ Not Configured"
-        
-        # Test proxy connection
-        proxy_ip = "Checking..."
-        if PROXY_URL:
-            try:
-                async with httpx.AsyncClient(proxy=PROXY_URL, verify=False, timeout=10.0) as client:
-                    proxy_ip = await get_current_ip(client)
-            except:
-                proxy_ip = "Failed to connect"
-        
-        welcome_msg = f"""
-🚀 *CRICWAY PROXY BOT* 🚀
+        msg = f"""
+🚀 *ULTRA-FAST CRICWAY BOT* 🚀
 
-*Proxy Status:*
-🔐 Proxy: {proxy_status}
-🌍 Proxy IP: `{proxy_ip}`
-📍 Location: {PROXY_STATE or 'Auto'}
+📊 *STATISTICS*
+├ 👥 Accounts: `{stats['total_accounts']}`
+├ 💰 Total Balance: `₹{stats['total_balance']:.2f}`
+├ 📊 Today Claims: `{stats['today_claims']}`
+├ 💎 Today Bonus: `₹{stats['today_bonus']:.2f}`
+└ 🏆 Total Bonus: `₹{stats['total_bonus']:.2f}`
 
-*Bot Stats:*
-👥 Accounts: {stats['total_accounts']}
-📊 Today Claims: {stats['today_claims']}
-💰 Today Bonus: ₹{stats['today_bonus']:.2f}
+⚡ *COMMANDS*
+├ `/add user pass` - Add account
+├ `/loginall` - Login all accounts
+├ `/claim CODE` - Claim coupon (ULTRA FAST!)
+├ `/balance` - Show all balances
+├ `/check` - Check login status
+├ `/stats` - View statistics
+└ `/remove user` - Remove account
 
-*Commands:*
-🔐 `/add username password` - Add account
-🔄 `/loginall` - Login all accounts
-🎫 `/claim CODE` - Claim coupon
-💰 `/balance` - Check balances
-✅ `/check` - Check login status
-📊 `/stats` - Statistics
-🌍 `/ip` - Show proxy IP
-❌ `/remove username` - Remove account
+🎯 *SPEED: 50 accounts in 3-5 seconds!*
         """
-        await update.message.reply_text(welcome_msg, parse_mode='Markdown')
-    
-    async def show_ip(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("🌍 Checking proxy IP...")
-        
-        try:
-            async with httpx.AsyncClient(proxy=PROXY_URL, verify=False, timeout=10.0) as client:
-                ip = await get_current_ip(client)
-                await update.message.reply_text(f"🌍 Current Proxy IP: `{ip}`", parse_mode='Markdown')
-        except Exception as e:
-            await update.message.reply_text(f"❌ Failed to get proxy IP: {str(e)}")
+        await update.message.reply_text(msg, parse_mode='Markdown')
     
     async def add_account(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         args = context.args
@@ -474,65 +338,78 @@ class CricwayBot:
         
         username, password = args[0], args[1]
         
-        await update.message.reply_text(f"🔐 Verifying account *{username}* via proxy...\n⏳ Please wait...", parse_mode='Markdown')
+        status_msg = await update.message.reply_text(f"🔐 Adding *{username}*...", parse_mode='Markdown')
         
         account = FastCricwayAccount(username, password)
         
         try:
-            async with httpx.AsyncClient(
-                http2=True, 
-                verify=False, 
-                proxy=PROXY_URL,
-                timeout=30.0,
-                follow_redirects=True
-            ) as client:
-                # Get proxy IP first
-                proxy_ip = await get_current_ip(client)
-                print(f"🌍 Using proxy IP: {proxy_ip}")
+            async with httpx.AsyncClient(proxy=PROXY_URL, verify=False, timeout=15.0) as client:
+                success, msg = await account.fast_login(client)
                 
-                success, msg = await account.async_login(client)
-            
-            if success:
-                self.db.add_account(username, password, account.user_id, account.auth_token, proxy_ip)
-                self.load_accounts()
-                await update.message.reply_text(
-                    f"✅ Account *{username}* added successfully!\n"
-                    f"🆔 User ID: `{account.user_id}`\n"
-                    f"🌍 Login IP: `{proxy_ip}`",
-                    parse_mode='Markdown'
-                )
-            else:
-                error_msg = f"❌ Failed to add *{username}*\n\nReason: `{msg}`"
-                await update.message.reply_text(error_msg, parse_mode='Markdown')
-                
+                if success:
+                    # Get initial balance
+                    bal_success, balance = await account.fast_balance(client)
+                    
+                    self.db.add_account(username, password, account.user_id, account.auth_token, None, balance)
+                    self.load_accounts()
+                    
+                    await status_msg.edit_text(
+                        f"✅ *{username}* ADDED!\n"
+                        f"├ 🆔 ID: `{account.user_id}`\n"
+                        f"└ 💰 Balance: `₹{balance:.2f}`",
+                        parse_mode='Markdown'
+                    )
+                else:
+                    await status_msg.edit_text(f"❌ Failed: `{msg}`", parse_mode='Markdown')
         except Exception as e:
-            await update.message.reply_text(f"❌ Error: `{str(e)}`", parse_mode='Markdown')
+            await status_msg.edit_text(f"❌ Error: `{str(e)[:100]}`", parse_mode='Markdown')
     
-    async def login_all_accounts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def login_all(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.accounts:
             await update.message.reply_text("❌ No accounts found!")
             return
         
-        await update.message.reply_text(f"🔄 Re-logging {len(self.accounts)} accounts via proxy...")
+        status_msg = await update.message.reply_text(f"🔄 Logging in {len(self.accounts)} accounts...\n⏱️ Estimated: 2-3 seconds")
+        start_time = time.time()
         
-        async with httpx.AsyncClient(http2=True, verify=False, proxy=PROXY_URL, timeout=30.0) as client:
-            proxy_ip = await get_current_ip(client)
-            
-            tasks = [acc.async_login(client) for acc in self.accounts]
+        async with httpx.AsyncClient(proxy=PROXY_URL, verify=False, timeout=15.0) as client:
+            tasks = [acc.fast_login(client) for acc in self.accounts]
             results = await asyncio.gather(*tasks)
         
-        success_count = sum(1 for r in results if r[0])
+        success = sum(1 for r in results if r[0])
+        elapsed = time.time() - start_time
         
-        result_msg = f"✅ *Login Complete!*\n"
-        result_msg += f"🌍 Proxy IP: `{proxy_ip}`\n"
-        result_msg += f"📊 Success: {success_count}/{len(self.accounts)}"
+        await status_msg.edit_text(
+            f"✅ *LOGIN COMPLETE*\n"
+            f"├ ⚡ Time: `{elapsed:.2f}s`\n"
+            f"├ 📊 Success: `{success}/{len(self.accounts)}`\n"
+            f"└ 💰 Total Balance: Updating...",
+            parse_mode='Markdown'
+        )
         
-        await update.message.reply_text(result_msg, parse_mode='Markdown')
+        # Update balances
+        async with httpx.AsyncClient(proxy=PROXY_URL, verify=False, timeout=15.0) as client:
+            balance_tasks = [acc.fast_balance(client) for acc in self.accounts]
+            balance_results = await asyncio.gather(*balance_tasks)
+        
+        total_balance = sum(b[1] for b in balance_results if b[0])
+        
+        for acc, (success, balance) in zip(self.accounts, balance_results):
+            if success:
+                self.db.update_account(acc.username, acc.auth_token, acc.user_id, None, balance)
+        
+        await status_msg.edit_text(
+            f"✅ *LOGIN COMPLETE*\n"
+            f"├ ⚡ Time: `{elapsed:.2f}s`\n"
+            f"├ 📊 Success: `{success}/{len(self.accounts)}`\n"
+            f"└ 💰 Total Balance: `₹{total_balance:.2f}`",
+            parse_mode='Markdown'
+        )
     
     async def claim_coupon(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         args = context.args
         if not args:
-            await update.message.reply_text("❌ Usage: `/claim COUPON_CODE`", parse_mode='Markdown')
+            await update.message.reply_text("❌ Usage: `/claim COUPON_CODE`\nExample: `/claim 200WAYCRIC`", parse_mode='Markdown')
             return
         
         coupon_code = args[0].upper()
@@ -541,103 +418,188 @@ class CricwayBot:
             await update.message.reply_text("❌ No accounts found!")
             return
         
-        await update.message.reply_text(f"⚡ Claiming *{coupon_code}* for {len(self.accounts)} accounts...")
+        status_msg = await update.message.reply_text(
+            f"🎫 *CLAIMING* `{coupon_code}`\n"
+            f"├ 👥 Accounts: `{len(self.accounts)}`\n"
+            f"├ ⚡ Speed: ULTRA FAST\n"
+            f"└ ⏱️ Estimated: 3-5 seconds",
+            parse_mode='Markdown'
+        )
         
-        async with httpx.AsyncClient(http2=True, verify=False, proxy=PROXY_URL, timeout=30.0) as client:
-            proxy_ip = await get_current_ip(client)
+        start_time = time.time()
+        
+        async with httpx.AsyncClient(proxy=PROXY_URL, verify=False, timeout=15.0) as client:
+            # Get balances BEFORE (parallel)
+            before_tasks = [acc.fast_balance(client) for acc in self.accounts]
+            before_results = await asyncio.gather(*before_tasks)
             
-            # Get balances before
-            balance_tasks = [acc.async_get_balance(client) for acc in self.accounts]
-            balances_before = await asyncio.gather(*balance_tasks)
-            
-            # Claim coupons
-            claim_tasks = [acc.async_claim_coupon(client, coupon_code) for acc in self.accounts]
+            # Claim coupons (parallel)
+            claim_tasks = [acc.fast_claim(client, coupon_code) for acc in self.accounts]
             claim_results = await asyncio.gather(*claim_tasks)
             
-            # Get balances after
-            balance_after_tasks = [acc.async_get_balance(client) for acc in self.accounts]
-            balances_after = await asyncio.gather(*balance_after_tasks)
+            # Get balances AFTER (parallel)
+            after_tasks = [acc.fast_balance(client) for acc in self.accounts]
+            after_results = await asyncio.gather(*after_tasks)
         
-        success_count = sum(1 for r in claim_results if r[0])
-        total_bonus = sum(r[2] for r in claim_results if r[0])
+        elapsed = time.time() - start_time
         
-        # Save to database
+        # Process results
+        results = []
+        success_count = 0
+        total_bonus = 0
+        total_balance_before = 0
+        total_balance_after = 0
+        
         for i, acc in enumerate(self.accounts):
-            if claim_results[i][0]:
-                self.db.save_coupon_claim(
-                    acc.username, coupon_code, "SUCCESS",
-                    claim_results[i][2],
-                    balances_before[i][1] if balances_before[i][0] else 0,
-                    balances_after[i][1] if balances_after[i][0] else 0,
-                    proxy_ip
-                )
+            before_balance = before_results[i][1] if before_results[i][0] else 0
+            after_balance = after_results[i][1] if after_results[i][0] else 0
+            claim_success = claim_results[i][0]
+            claim_msg = claim_results[i][1]
+            bonus = claim_results[i][2]
+            
+            if claim_success:
+                success_count += 1
+                total_bonus += bonus
+                total_balance_before += before_balance
+                total_balance_after += after_balance
+            else:
+                total_balance_before += before_balance
+                total_balance_after += before_balance
+            
+            results.append({
+                'username': acc.username,
+                'success': claim_success,
+                'message': claim_msg,
+                'bonus': bonus,
+                'before': before_balance,
+                'after': after_balance
+            })
+            
+            # Save to database
+            self.db.save_coupon_claim(
+                acc.username, coupon_code,
+                "SUCCESS" if claim_success else "FAILED",
+                bonus, before_balance, after_balance
+            )
         
-        result_msg = f"🎫 *{coupon_code}*\n"
-        result_msg += f"🌍 Proxy IP: `{proxy_ip}`\n"
-        result_msg += f"📊 Success: {success_count}/{len(self.accounts)}\n"
-        result_msg += f"💰 Total Bonus: ₹{total_bonus:.2f}"
+        # Calculate total change
+        total_change = total_balance_after - total_balance_before
         
-        await update.message.reply_text(result_msg, parse_mode='Markdown')
+        # Format response
+        response = f"🎫 *COUPON: {coupon_code}*\n"
+        response += f"├ ⚡ Time: `{elapsed:.2f} seconds`\n"
+        response += f"├ 📊 Success: `{success_count}/{len(self.accounts)}`\n"
+        response += f"├ 💰 Bonus: `₹{total_bonus:.2f}`\n"
+        response += f"└ 📈 Total Change: `₹{total_change:+.2f}`\n\n"
+        
+        # Show top 10 results
+        response += "*DETAILS:*\n"
+        
+        # Sort by bonus (highest first)
+        results.sort(key=lambda x: x['bonus'], reverse=True)
+        
+        for r in results[:15]:
+            if r['success']:
+                change = r['after'] - r['before']
+                if r['bonus'] > 0:
+                    response += f"✅ *{r['username'][:15]}*: +₹{change:.0f} 💰\n"
+                else:
+                    response += f"✅ *{r['username'][:15]}*: ₹{r['after']:.0f}\n"
+            else:
+                response += f"❌ *{r['username'][:15]}*: {r['message'][:20]}\n"
+        
+        if len(results) > 15:
+            response += f"\n*... and {len(results)-15} more accounts*"
+        
+        # Add summary
+        response += f"\n📊 *SUMMARY*\n"
+        response += f"├ 💰 Before: `₹{total_balance_before:.2f}`\n"
+        response += f"├ 💰 After: `₹{total_balance_after:.2f}`\n"
+        response += f"└ 📈 Change: `₹{total_change:+.2f}`"
+        
+        await status_msg.edit_text(response, parse_mode='Markdown')
     
-    async def check_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def show_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.accounts:
             await update.message.reply_text("❌ No accounts found!")
             return
         
-        await update.message.reply_text("💰 Fetching balances...")
+        status_msg = await update.message.reply_text("💰 Fetching balances...")
         
-        async with httpx.AsyncClient(http2=True, verify=False, proxy=PROXY_URL, timeout=30.0) as client:
-            tasks = [acc.async_get_balance(client) for acc in self.accounts]
+        async with httpx.AsyncClient(proxy=PROXY_URL, verify=False, timeout=15.0) as client:
+            tasks = [acc.fast_balance(client) for acc in self.accounts]
             results = await asyncio.gather(*tasks)
         
-        balance_msg = "💰 *Balances*\n\n"
+        # Update database
+        for acc, (success, balance) in zip(self.accounts, results):
+            if success:
+                self.db.update_account(acc.username, None, None, None, balance)
+        
+        response = "💰 *ALL BALANCES*\n\n"
         total = 0
+        online = 0
         
         for acc, (success, balance) in zip(self.accounts, results):
             if success:
-                balance_msg += f"✅ *{acc.username}*: ₹{balance:.2f}\n"
+                response += f"✅ *{acc.username}*: `₹{balance:.2f}`\n"
                 total += balance
+                online += 1
             else:
-                balance_msg += f"❌ *{acc.username}*: Failed\n"
+                response += f"❌ *{acc.username}*: `Offline`\n"
         
-        balance_msg += f"\n📊 *Total*: ₹{total:.2f}"
-        await update.message.reply_text(balance_msg, parse_mode='Markdown')
+        response += f"\n📊 *SUMMARY*\n"
+        response += f"├ 👥 Online: `{online}/{len(self.accounts)}`\n"
+        response += f"└ 💰 Total: `₹{total:.2f}`"
+        
+        await status_msg.edit_text(response, parse_mode='Markdown')
     
     async def check_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.accounts:
             await update.message.reply_text("❌ No accounts found!")
             return
         
-        await update.message.reply_text("🔍 Checking login status...")
+        await update.message.reply_text("🔍 Checking status...")
         
-        async with httpx.AsyncClient(http2=True, verify=False, proxy=PROXY_URL, timeout=30.0) as client:
-            tasks = [acc.async_get_balance(client) for acc in self.accounts]
+        async with httpx.AsyncClient(proxy=PROXY_URL, verify=False, timeout=15.0) as client:
+            tasks = [acc.fast_balance(client) for acc in self.accounts]
             results = await asyncio.gather(*tasks)
         
-        status_msg = "✅ *Account Status*\n\n"
-        working = 0
+        online = sum(1 for r in results if r[0])
         
-        for acc, (success, _) in zip(self.accounts, results):
-            if success:
-                status_msg += f"✅ *{acc.username}*: Online\n"
-                working += 1
-            else:
-                status_msg += f"❌ *{acc.username}*: Offline\n"
+        response = f"✅ *STATUS*\n"
+        response += f"├ 👥 Online: `{online}/{len(self.accounts)}`\n"
         
-        status_msg += f"\n📊 Online: {working}/{len(self.accounts)}"
-        await update.message.reply_text(status_msg, parse_mode='Markdown')
+        if online == len(self.accounts):
+            response += f"└ 🟢 All accounts online!"
+        elif online > 0:
+            response += f"└ 🟡 {len(self.accounts)-online} accounts offline"
+        else:
+            response += f"└ 🔴 All accounts offline!"
+        
+        await update.message.reply_text(response, parse_mode='Markdown')
     
-    async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def show_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         stats = self.db.get_stats()
         
-        stats_msg = f"📊 *Bot Statistics*\n\n"
-        stats_msg += f"👥 Total Accounts: {stats['total_accounts']}\n"
-        stats_msg += f"📝 Today's Claims: {stats['today_claims']}\n"
-        stats_msg += f"💰 Today's Bonus: ₹{stats['today_bonus']:.2f}\n"
-        stats_msg += f"📊 Total Claims: {stats['total_claims']}\n"
-        stats_msg += f"💎 Total Bonus: ₹{stats['total_bonus']:.2f}"
+        # Calculate average bonus
+        avg_bonus = stats['total_bonus'] / stats['total_claims'] if stats['total_claims'] > 0 else 0
         
-        await update.message.reply_text(stats_msg, parse_mode='Markdown')
+        response = f"📊 *BOT STATISTICS*\n\n"
+        response += f"👥 *ACCOUNTS*\n"
+        response += f"├ Total: `{stats['total_accounts']}`\n"
+        response += f"└ Active: `{stats['total_accounts']}`\n\n"
+        
+        response += f"💰 *BALANCE*\n"
+        response += f"└ Total: `₹{stats['total_balance']:.2f}`\n\n"
+        
+        response += f"🎫 *COUPONS*\n"
+        response += f"├ Total Claims: `{stats['total_claims']}`\n"
+        response += f"├ Today Claims: `{stats['today_claims']}`\n"
+        response += f"├ Total Bonus: `₹{stats['total_bonus']:.2f}`\n"
+        response += f"├ Today Bonus: `₹{stats['today_bonus']:.2f}`\n"
+        response += f"└ Average Bonus: `₹{avg_bonus:.2f}`"
+        
+        await update.message.reply_text(response, parse_mode='Markdown')
     
     async def remove_account(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         args = context.args
@@ -648,7 +610,8 @@ class CricwayBot:
         username = args[0]
         self.db.delete_account(username)
         self.load_accounts()
-        await update.message.reply_text(f"✅ Account *{username}* removed!", parse_mode='Markdown')
+        
+        await update.message.reply_text(f"✅ *{username}* removed!", parse_mode='Markdown')
 
 # ==================== MAIN ====================
 def main():
@@ -659,30 +622,29 @@ def main():
         return
     
     # Print configuration
-    print("\n" + "="*60)
-    print("🚀 CRICWAY PROXY BOT STARTING")
-    print("="*60)
-    print(f"🤖 Bot Token: {BOT_TOKEN[:10]}...")
-    print(f"🔐 Proxy: {PROXY_TYPE.upper()}://{PROXY_HOST}:{PROXY_PORT}")
-    print(f"📍 State: {PROXY_STATE or 'Auto'}")
-    print(f"👤 Username: {PROXY_USER[:30]}...")
-    print("="*60 + "\n")
+    print("\n" + "="*50)
+    print("🚀 ULTRA-FAST CRICWAY BOT")
+    print("="*50)
+    if PROXY_URL:
+        print(f"✅ Proxy: {PROXY_TYPE}://{PROXY_HOST}:{PROXY_PORT}")
+    else:
+        print("⚠️ No proxy configured")
+    print("="*50 + "\n")
     
-    bot = CricwayBot()
+    bot = UltraFastBot()
     app = Application.builder().token(BOT_TOKEN).build()
     
     app.add_handler(CommandHandler("start", bot.start))
     app.add_handler(CommandHandler("add", bot.add_account))
-    app.add_handler(CommandHandler("loginall", bot.login_all_accounts))
+    app.add_handler(CommandHandler("loginall", bot.login_all))
     app.add_handler(CommandHandler("claim", bot.claim_coupon))
-    app.add_handler(CommandHandler("balance", bot.check_balance))
+    app.add_handler(CommandHandler("balance", bot.show_balance))
     app.add_handler(CommandHandler("check", bot.check_status))
-    app.add_handler(CommandHandler("stats", bot.stats))
+    app.add_handler(CommandHandler("stats", bot.show_stats))
     app.add_handler(CommandHandler("remove", bot.remove_account))
-    app.add_handler(CommandHandler("ip", bot.show_ip))
     
-    print("🚀 Bot is starting...")
-    print("✅ Bot is ready!\n")
+    print("🚀 Bot is running...")
+    print("✅ Ready for ultra-fast coupon claiming!\n")
     
     app.run_polling()
 
