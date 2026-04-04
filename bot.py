@@ -4,7 +4,6 @@ import sqlite3
 import asyncio
 import httpx
 import time
-import base64
 from typing import Dict, Optional, Tuple, List
 from datetime import datetime
 from dotenv import load_dotenv
@@ -163,6 +162,8 @@ class Database:
             'total_bonus': total_bonus
         }
 
+import httpx
+
 # ==================== ASYNC API CLIENT ====================
 class FastCricwayAccount:
     def __init__(self, username: str, password: str, auth_token: str = None, user_id: str = None):
@@ -199,7 +200,7 @@ class FastCricwayAccount:
             'loginRequestType': 'PHONE_SIGN_IN',
         }
         
-        print(f"🔍 [DEBUG] Attempting login for {self.username}")
+        print(f"🔍 [DEBUG] Attempting login for {self.username} (Credentials only)")
         
         # Fresh login headers (no old auth token)
         login_headers = self.headers.copy()
@@ -207,13 +208,16 @@ class FastCricwayAccount:
             del login_headers['authorization']
         
         async def do_login(client_to_use):
-            response = await client_to_use.post(
-                f'{self.base_url}/account/v2/login',
-                headers=login_headers,
-                json=json_data,
-                timeout=15.0
-            )
-            return response
+            try:
+                response = await client_to_use.post(
+                    f'{self.base_url}/account/v2/login',
+                    headers=login_headers,
+                    json=json_data,
+                    timeout=15.0
+                )
+                return response
+            except Exception as e:
+                raise e
 
         try:
             if client:
@@ -231,17 +235,18 @@ class FastCricwayAccount:
                             response = await do_login(new_client)
                     else:
                         raise h2_err
-            
+                
             status = response.status_code
             response_text = response.text
-            
+                
             if status == 200:
-                token = response_text.strip()
+                token = response_text
                 if token.startswith('eyJ'):
                     self.auth_token = token
                     self.headers['authorization'] = self.auth_token
                     
                     # Extract user_id from token
+                    import base64
                     token_parts = token.split('.')
                     if len(token_parts) > 1:
                         payload = token_parts[1]
@@ -255,9 +260,8 @@ class FastCricwayAccount:
             
             print(f"❌ [DEBUG] Login failed for {self.username}: HTTP {status}")
             if status == 403:
-                print(f"⚠️ [WARNING] Cloudflare Blocked! Response: {response_text[:200]}")
+                print(f"⚠️ [WARNING] Cloudflare Blocked Railway IP! Response: {response_text[:200]}")
             return False, f"HTTP {status}"
-            
         except Exception as e:
             print(f"❌ [DEBUG] Login error for {self.username}: {str(e)}")
             return False, str(e)
@@ -277,8 +281,7 @@ class FastCricwayAccount:
                 data = response.json()
                 return True, float(data.get('balance', 0))
             return False, 0
-        except Exception as e:
-            print(f"Balance error for {self.username}: {e}")
+        except:
             return False, 0
     
     async def async_claim_coupon(self, client: httpx.AsyncClient, coupon_code: str) -> Tuple[bool, str, float]:
@@ -288,7 +291,7 @@ class FastCricwayAccount:
         
         params = {'coupon_code': coupon_code}
         
-        print(f"🔍 [DEBUG] Claiming coupon {coupon_code} for {self.username}")
+        print(f"🔍 [DEBUG] Claiming coupon for {self.username} | Token: {self.auth_token[:20]}...")
         
         try:
             response = await client.get(
@@ -321,12 +324,11 @@ class FastCricwayAccount:
                     print(f"❌ [DEBUG] Claim failed for {self.username}: Limit exhausted")
                     return False, "Limit exhausted", 0
                 elif status == 401:
-                    print(f"❌ [DEBUG] Claim failed for {self.username}: Unauthorized")
-                    return False, "Unauthorized", 0
+                    print(f"❌ [DEBUG] Claim failed for {self.username}: Unauthorized (Token expired?)")
+                    return False, f"HTTP {status}", 0
                 else:
-                    print(f"❌ [DEBUG] Claim failed for {self.username}: HTTP {status}")
-                    return False, api_msg, 0
-                    
+                    print(f"❌ [DEBUG] Claim failed for {self.username}: HTTP {status} - {api_msg}")
+                    return False, f"{api_msg}", 0
         except Exception as e:
             print(f"❌ [DEBUG] Claim error for {self.username}: {str(e)}")
             return False, str(e), 0
@@ -392,131 +394,230 @@ class CricwayBot:
         
         # Verify account by logging in
         account = FastCricwayAccount(username, password)
-        try:
-            async with httpx.AsyncClient(http2=True, verify=False) as client:
-                success, msg = await account.async_login(client)
-        except Exception as e:
-            success, msg = False, str(e)
+        async with httpx.AsyncClient(http2=True, verify=False) as client:
+            success, msg = await account.async_login(client)
         
         if success:
             self.db.add_account(username, password, account.user_id, account.auth_token)
-            self.load_accounts()
+            self.load_accounts()  # Reload accounts
             await update.message.reply_text(
-                f"✅ Account *{username}* added successfully!\n🆔 User ID: {account.user_id}",
+                f"✅ Account *{username}* added successfully!\n"
+                f"🆔 User ID: {account.user_id}",
                 parse_mode='Markdown'
             )
         else:
             error_msg = f"❌ Failed to add *{username}*: {msg}"
+            if "403" in msg:
+                error_msg += (
+                    "\n\n⚠️ *Railway IP is Blocked by Cloudflare!*\n"
+                    "Cricway is blocking Railway's servers. I've tried using HTTP/2 to bypass it, "
+                    "but if it still fails, you may need to use a Proxy or run it locally."
+                )
             await update.message.reply_text(error_msg, parse_mode='Markdown')
     
     async def login_all_accounts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Auto re-login ALL accounts"""
-        if not self.accounts:
-            await update.message.reply_text("❌ No accounts found! Use /add first.")
-            return
+        """Auto re-login ALL accounts - Main feature"""
+        await update.message.reply_text(
+            f"🔄 Auto re-logging {len(self.accounts)} accounts in parallel...\n"
+            f"⏱️ Estimated time: 2-3 seconds",
+            parse_mode='Markdown'
+        )
         
-        await update.message.reply_text(f"🔄 Re-logging {len(self.accounts)} accounts...")
         start_time = time.time()
         
-        try:
-            async with httpx.AsyncClient(http2=True, verify=False) as client:
-                tasks = [acc.async_login(client) for acc in self.accounts]
-                results = await asyncio.gather(*tasks)
-        except Exception as e:
-            await update.message.reply_text(f"❌ Login failed: {str(e)}")
+        if not self.accounts:
+            await update.message.reply_text("❌ No accounts found! Use /add to add accounts first.")
             return
         
-        success_count = sum(1 for r in results if r[0])
+        async with httpx.AsyncClient(http2=True, verify=False) as client:
+            tasks = [acc.async_login(client) for acc in self.accounts]
+            results = await asyncio.gather(*tasks)
+        
+        # Update database with new tokens
+        success_count = 0
+        failed_accounts = []
+        
+        for acc, (success, msg) in zip(self.accounts, results):
+            if success:
+                self.db.update_account_token(acc.username, acc.auth_token, acc.user_id)
+                success_count += 1
+            else:
+                failed_accounts.append(f"{acc.username}: {msg}")
+        
         elapsed = time.time() - start_time
         
-        result_msg = f"✅ *Login Complete!*\n⏱️ Time: {elapsed:.2f}s\n📊 Success: {success_count}/{len(self.accounts)}"
+        result_msg = f"✅ *Login Complete!*\n"
+        result_msg += f"⏱️ Time: {elapsed:.2f} seconds\n"
+        result_msg += f"📊 Success: {success_count}/{len(self.accounts)}\n"
+        
+        if failed_accounts:
+            result_msg += f"\n❌ *Failed Accounts:*\n"
+            result_msg += "\n".join(failed_accounts[:5])
+            if len(failed_accounts) > 5:
+                result_msg += f"\n... and {len(failed_accounts) - 5} more"
+        
         await update.message.reply_text(result_msg, parse_mode='Markdown')
     
     async def claim_coupon(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Claim coupon for ALL accounts"""
+        """Claim coupon for ALL accounts in parallel"""
         args = context.args
         if not args:
-            await update.message.reply_text("❌ Usage: `/claim COUPON_CODE`", parse_mode='Markdown')
+            await update.message.reply_text("❌ Usage: `/claim COUPON_CODE`\nExample: `/claim 200WAYCRIC`", parse_mode='Markdown')
             return
         
         coupon_code = args[0].upper()
         
         if not self.accounts:
-            await update.message.reply_text("❌ No accounts found!")
+            await update.message.reply_text("❌ No accounts found! Use /add to add accounts first.")
             return
         
-        await update.message.reply_text(f"⚡ Claiming *{coupon_code}* for {len(self.accounts)} accounts...")
+        await update.message.reply_text(
+            f"⚡ Claiming *{coupon_code}* for {len(self.accounts)} accounts...\n"
+            f"⏱️ Estimated time: 3-5 seconds",
+            parse_mode='Markdown'
+        )
+        
         start_time = time.time()
         
-        try:
-            async with httpx.AsyncClient(http2=True, verify=False) as client:
-                # Get balances before
-                balance_tasks = [acc.async_get_balance(client) for acc in self.accounts]
-                balances_before = await asyncio.gather(*balance_tasks)
+        async with httpx.AsyncClient(http2=True, verify=False) as client:
+            # Helper to claim with auto-relogin
+            async def claim_with_retry(acc: FastCricwayAccount):
+                success, msg, bonus = await acc.async_claim_coupon(client, coupon_code)
                 
-                # Claim coupons
-                claim_tasks = [acc.async_claim_coupon(client, coupon_code) for acc in self.accounts]
-                claim_results = await asyncio.gather(*claim_tasks)
+                # If unauthorized, try to login and retry once
+                if not success and "401" in msg:
+                    print(f"🔄 [RELOGIN] Token expired for {acc.username}, attempting auto-relogin...")
+                    login_success, login_msg = await acc.async_login(client)
+                    if login_success:
+                        # Update DB with new token
+                        self.db.update_account_token(acc.username, acc.auth_token, acc.user_id)
+                        # Retry claim
+                        success, msg, bonus = await acc.async_claim_coupon(client, coupon_code)
+                        if success:
+                            msg = f"Success (after relogin)"
+                        else:
+                            msg = f"Failed (after relogin: {msg})"
+                    else:
+                        msg = f"Auth Failed: {login_msg}"
                 
-                # Get balances after
-                balance_after_tasks = [acc.async_get_balance(client) for acc in self.accounts]
-                balances_after = await asyncio.gather(*balance_after_tasks)
-        except Exception as e:
-            await update.message.reply_text(f"❌ Claim failed: {str(e)}")
-            return
+                return success, msg, bonus
+
+            # Get balances BEFORE
+            balance_tasks = [acc.async_get_balance(client) for acc in self.accounts]
+            balances_before = await asyncio.gather(*balance_tasks)
+            
+            # Claim coupons with auto-retry logic
+            claim_tasks = [claim_with_retry(acc) for acc in self.accounts]
+            claim_results = await asyncio.gather(*claim_tasks)
+            
+            # Get balances AFTER
+            balance_after_tasks = [acc.async_get_balance(client) for acc in self.accounts]
+            balances_after = await asyncio.gather(*balance_after_tasks)
         
         elapsed = time.time() - start_time
         
-        success_count = sum(1 for r in claim_results if r[0])
-        total_bonus = sum(r[2] for r in claim_results if r[0])
+        # Process results
+        success_count = 0
+        total_bonus = 0
+        results_list = []
         
-        result_msg = f"🎫 *{coupon_code}*\n⚡ Time: {elapsed:.2f}s\n📊 Success: {success_count}/{len(self.accounts)}\n💰 Total Bonus: ₹{total_bonus:.2f}"
+        for i, acc in enumerate(self.accounts):
+            balance_before = balances_before[i][1] if balances_before[i][0] else 0
+            balance_after = balances_after[i][1] if balances_after[i][0] else 0
+            claim_success = claim_results[i][0]
+            claim_msg = claim_results[i][1]
+            bonus = claim_results[i][2]
+            
+            if claim_success:
+                success_count += 1
+                total_bonus += bonus
+            
+            results_list.append({
+                'username': acc.username,
+                'success': claim_success,
+                'message': claim_msg,
+                'bonus': bonus,
+                'balance_before': balance_before,
+                'balance_after': balance_after
+            })
+            
+            # Save to database
+            self.db.save_coupon_claim(
+                acc.username, coupon_code, 
+                "SUCCESS" if claim_success else "FAILED",
+                bonus, balance_before, balance_after
+            )
+        
+        # Format results
+        result_msg = f"🎫 *Coupon: {coupon_code}*\n"
+        result_msg += f"⚡ Time: {elapsed:.2f} seconds\n"
+        result_msg += f"📊 Success: {success_count}/{len(self.accounts)}\n"
+        result_msg += f"💰 Total Bonus: ₹{total_bonus:.2f}\n\n"
+        
+        # Show results (first 10)
+        for r in results_list[:10]:
+            status = "✅" if r['success'] else "❌"
+            result_msg += f"{status} *{r['username']}*: "
+            if r['success']:
+                change = r['balance_after'] - r['balance_before']
+                result_msg += f"₹{change:+.0f}"
+                if r['bonus'] > 0:
+                    result_msg += f" (Bonus: ₹{r['bonus']:.0f})"
+            else:
+                result_msg += f"{r['message']}"
+            result_msg += "\n"
+        
+        if len(results_list) > 10:
+            result_msg += f"\n... and {len(results_list) - 10} more accounts"
+        
         await update.message.reply_text(result_msg, parse_mode='Markdown')
     
     async def check_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Check all balances"""
+        """Check balance of all accounts"""
+        await update.message.reply_text("💰 Fetching all balances...")
+        
         if not self.accounts:
             await update.message.reply_text("❌ No accounts found!")
             return
         
-        await update.message.reply_text("💰 Fetching balances...")
+        start_time = time.time()
         
-        try:
-            async with httpx.AsyncClient(http2=True, verify=False) as client:
-                tasks = [acc.async_get_balance(client) for acc in self.accounts]
-                results = await asyncio.gather(*tasks)
-        except Exception as e:
-            await update.message.reply_text(f"❌ Failed: {str(e)}")
-            return
+        async with httpx.AsyncClient(http2=True, verify=False) as client:
+            tasks = [acc.async_get_balance(client) for acc in self.accounts]
+            results = await asyncio.gather(*tasks)
         
-        balance_msg = "💰 *Balances*\n\n"
-        total = 0
+        elapsed = time.time() - start_time
+        
+        balance_msg = f"💰 *Balances* (fetched in {elapsed:.2f}s)\n\n"
+        total_balance = 0
+        active_count = 0
         
         for acc, (success, balance) in zip(self.accounts, results):
             if success:
                 balance_msg += f"✅ *{acc.username}*: ₹{balance:.2f}\n"
-                total += balance
+                total_balance += balance
+                active_count += 1
+                self.db.save_balance(acc.username, balance)
             else:
                 balance_msg += f"❌ *{acc.username}*: Failed\n"
         
-        balance_msg += f"\n📊 *Total*: ₹{total:.2f}"
+        balance_msg += f"\n📊 *Summary:*\n"
+        balance_msg += f"👥 Active: {active_count}/{len(self.accounts)}\n"
+        balance_msg += f"💰 Total: ₹{total_balance:.2f}"
+        
         await update.message.reply_text(balance_msg, parse_mode='Markdown')
     
     async def check_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Check login status"""
+        """Check login status of all accounts"""
         if not self.accounts:
             await update.message.reply_text("❌ No accounts found!")
             return
         
-        await update.message.reply_text("🔍 Checking status...")
+        await update.message.reply_text("🔍 Checking login status...")
         
-        try:
-            async with httpx.AsyncClient(http2=True, verify=False) as client:
-                tasks = [acc.async_get_balance(client) for acc in self.accounts]
-                results = await asyncio.gather(*tasks)
-        except Exception as e:
-            await update.message.reply_text(f"❌ Failed: {str(e)}")
-            return
+        async with httpx.AsyncClient(http2=True, verify=False) as client:
+            tasks = [acc.async_get_balance(client) for acc in self.accounts]
+            results = await asyncio.gather(*tasks)
         
         status_msg = "✅ *Account Status*\n\n"
         working = 0
@@ -526,39 +627,44 @@ class CricwayBot:
                 status_msg += f"✅ *{acc.username}*: Online\n"
                 working += 1
             else:
-                status_msg += f"❌ *{acc.username}*: Offline\n"
+                status_msg += f"❌ *{acc.username}*: Offline/Expired\n"
         
         status_msg += f"\n📊 Online: {working}/{len(self.accounts)}"
+        
         await update.message.reply_text(status_msg, parse_mode='Markdown')
     
     async def relogin_account(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Re-login specific account"""
+        """Re-login specific account using username and password"""
         args = context.args
         if not args:
-            await update.message.reply_text("❌ Usage: `/relogin username`", parse_mode='Markdown')
+            await update.message.reply_text("❌ Usage: `/relogin username [password]`", parse_mode='Markdown')
             return
         
         username = args[0]
+        password = args[1] if len(args) > 1 else None
         
+        # Find account
         account = next((acc for acc in self.accounts if acc.username == username), None)
         if not account:
             await update.message.reply_text(f"❌ Account *{username}* not found!", parse_mode='Markdown')
             return
         
-        await update.message.reply_text(f"🔄 Re-logging *{username}*...", parse_mode='Markdown')
+        # If password provided, update it in account object
+        if password:
+            account.password = password
+            print(f"🔄 Updating password for {username}")
         
-        try:
-            async with httpx.AsyncClient(http2=True, verify=False) as client:
-                success, msg = await account.async_login(client)
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-            return
+        await update.message.reply_text(f"🔄 Re-logging *{username}* using credentials...", parse_mode='Markdown')
+        
+        async with httpx.AsyncClient(http2=True, verify=False) as client:
+            success, msg = await account.async_login(client)
         
         if success:
-            self.db.update_account_token(username, account.auth_token, account.user_id)
+            # Update database with new token and password (if changed)
+            self.db.add_account(username, account.password, account.user_id, account.auth_token)
             await update.message.reply_text(f"✅ *{username}* re-logged successfully!", parse_mode='Markdown')
         else:
-            await update.message.reply_text(f"❌ Failed: {msg}", parse_mode='Markdown')
+            await update.message.reply_text(f"❌ Failed to re-login *{username}*: {msg}", parse_mode='Markdown')
     
     async def remove_account(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Remove an account"""
@@ -569,8 +675,9 @@ class CricwayBot:
         
         username = args[0]
         self.db.delete_account(username)
-        self.load_accounts()
-        await update.message.reply_text(f"✅ Account *{username}* removed!", parse_mode='Markdown')
+        self.load_accounts()  # Reload accounts
+        
+        await update.message.reply_text(f"✅ Account *{username}* removed successfully!", parse_mode='Markdown')
     
     async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show statistics"""
@@ -581,25 +688,33 @@ class CricwayBot:
         stats_msg += f"📝 Today's Claims: {stats['today_claims']}\n"
         stats_msg += f"💰 Today's Bonus: ₹{stats['today_bonus']:.2f}\n"
         stats_msg += f"📊 Total Claims: {stats['total_claims']}\n"
-        stats_msg += f"💎 Total Bonus: ₹{stats['total_bonus']:.2f}"
+        stats_msg += f"💎 Total Bonus: ₹{stats['total_bonus']:.2f}\n"
+        
+        if stats['total_claims'] > 0:
+            avg_bonus = stats['total_bonus'] / stats['total_claims']
+            stats_msg += f"📈 Average Bonus: ₹{avg_bonus:.2f}\n"
         
         await update.message.reply_text(stats_msg, parse_mode='Markdown')
 
 # ==================== MAIN ====================
 def main():
+    # Get bot token from environment variable
     BOT_TOKEN = os.getenv('BOT_TOKEN')
     
     if not BOT_TOKEN:
-        print("❌ BOT_TOKEN not found!")
-        print("Please set BOT_TOKEN in environment variables")
+        print("❌ BOT_TOKEN not found in environment variables!")
+        print("Please set BOT_TOKEN in .env file or Railway environment variables")
         return
     
     bot = CricwayBot()
+    
+    # Create application
     app = Application.builder().token(BOT_TOKEN).build()
     
+    # Add command handlers
     app.add_handler(CommandHandler("start", bot.start))
     app.add_handler(CommandHandler("add", bot.add_account))
-    app.add_handler(CommandHandler("loginall", bot.login_all_accounts))
+    app.add_handler(CommandHandler("loginall", bot.login_all_accounts))  # Auto re-login all
     app.add_handler(CommandHandler("claim", bot.claim_coupon))
     app.add_handler(CommandHandler("balance", bot.check_balance))
     app.add_handler(CommandHandler("check", bot.check_status))
@@ -607,7 +722,8 @@ def main():
     app.add_handler(CommandHandler("remove", bot.remove_account))
     app.add_handler(CommandHandler("stats", bot.stats))
     
-    print("🚀 Bot is starting...")
+    # Start bot
+    print("🚀 Bot is starting on Railway...")
     print(f"📊 Loaded {len(bot.accounts)} accounts")
     print("✅ Bot is ready!")
     
