@@ -10,9 +10,6 @@ from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from concurrent.futures import ThreadPoolExecutor
-import asyncio
-from asyncio import Semaphore
 
 # Load environment variables
 load_dotenv()
@@ -148,7 +145,6 @@ class Database:
         )
         self.conn.commit()
         
-        # Update account balance
         if status == "SUCCESS":
             cursor.execute("UPDATE accounts SET balance = ? WHERE username = ?", (balance_after, username))
             self.conn.commit()
@@ -255,40 +251,61 @@ class FastCricwayAccount:
             return False, 0
     
     async def fast_claim(self, client: httpx.AsyncClient, coupon_code: str) -> Tuple[bool, str, float]:
-        """Fast coupon claim"""
+        """Fast coupon claim - FIXED ENDPOINT"""
         if not self.auth_token:
             return False, "Not authenticated", 0
         
-        params = {'coupon_code': coupon_code}
+        # Try different endpoints
+        endpoints = [
+            f'/marketing/v1/bonuses/apply',
+            f'/marketing/v1/bonuses/redeem',
+            f'/promotion/v1/coupons/redeem',
+            f'/coupon/v1/redeem',
+            f'/marketing/v1/coupons/{coupon_code}/redeem',
+            f'/bonus/v1/claim',
+        ]
         
-        try:
-            response = await client.get(
-                f'{self.base_url}/marketing/v1/bonuses/special-bonus',
-                headers=self.headers,
-                params=params,
-                timeout=8.0
-            )
-            
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    bonus = data.get('data', {}).get('amount', 0)
-                    return True, "Success", float(bonus)
-                except:
-                    return True, "Claimed", 0
-            elif response.status_code == 409:
-                return False, "Limit exhausted", 0
-            else:
-                return False, f"HTTP {response.status_code}", 0
-        except Exception as e:
-            return False, str(e), 0
+        for endpoint in endpoints:
+            try:
+                if '{coupon_code}' in endpoint:
+                    url = f'{self.base_url}{endpoint.format(coupon_code=coupon_code)}'
+                    params = None
+                else:
+                    url = f'{self.base_url}{endpoint}'
+                    params = {'coupon_code': coupon_code}
+                
+                response = await client.post(
+                    url,
+                    headers=self.headers,
+                    params=params,
+                    json={'couponCode': coupon_code, 'coupon_code': coupon_code},
+                    timeout=8.0
+                )
+                
+                if response.status_code == 200:
+                    try:
+                        data = response.json()
+                        bonus = 0
+                        if 'data' in data:
+                            bonus = data['data'].get('amount', data['data'].get('bonus', 0))
+                        elif 'amount' in data:
+                            bonus = data['amount']
+                        elif 'bonus' in data:
+                            bonus = data['bonus']
+                        return True, "Success", float(bonus)
+                    except:
+                        return True, "Claimed", 0
+                        
+            except Exception as e:
+                continue
+        
+        return False, "No working endpoint found", 0
 
 # ==================== ULTRA FAST BOT ====================
 class UltraFastBot:
     def __init__(self):
         self.db = Database()
         self.accounts = []
-        self.semaphore = Semaphore(50)  # Max 50 concurrent requests
         self.load_accounts()
     
     def load_accounts(self):
@@ -320,7 +337,7 @@ class UltraFastBot:
 ⚡ *COMMANDS*
 ├ `/add user pass` - Add account
 ├ `/loginall` - Login all accounts
-├ `/claim CODE` - Claim coupon (ULTRA FAST!)
+├ `/claim CODE` - Claim coupon
 ├ `/balance` - Show all balances
 ├ `/check` - Check login status
 ├ `/stats` - View statistics
@@ -347,7 +364,6 @@ class UltraFastBot:
                 success, msg = await account.fast_login(client)
                 
                 if success:
-                    # Get initial balance
                     bal_success, balance = await account.fast_balance(client)
                     
                     self.db.add_account(username, password, account.user_id, account.auth_token, None, balance)
@@ -369,7 +385,7 @@ class UltraFastBot:
             await update.message.reply_text("❌ No accounts found!")
             return
         
-        status_msg = await update.message.reply_text(f"🔄 Logging in {len(self.accounts)} accounts...\n⏱️ Estimated: 2-3 seconds")
+        status_msg = await update.message.reply_text(f"🔄 Logging in {len(self.accounts)} accounts...")
         start_time = time.time()
         
         async with httpx.AsyncClient(proxy=PROXY_URL, verify=False, timeout=15.0) as client:
@@ -379,14 +395,6 @@ class UltraFastBot:
         success = sum(1 for r in results if r[0])
         elapsed = time.time() - start_time
         
-        await status_msg.edit_text(
-            f"✅ *LOGIN COMPLETE*\n"
-            f"├ ⚡ Time: `{elapsed:.2f}s`\n"
-            f"├ 📊 Success: `{success}/{len(self.accounts)}`\n"
-            f"└ 💰 Total Balance: Updating...",
-            parse_mode='Markdown'
-        )
-        
         # Update balances
         async with httpx.AsyncClient(proxy=PROXY_URL, verify=False, timeout=15.0) as client:
             balance_tasks = [acc.fast_balance(client) for acc in self.accounts]
@@ -394,8 +402,8 @@ class UltraFastBot:
         
         total_balance = sum(b[1] for b in balance_results if b[0])
         
-        for acc, (success, balance) in zip(self.accounts, balance_results):
-            if success:
+        for acc, (bal_success, balance) in zip(self.accounts, balance_results):
+            if bal_success:
                 self.db.update_account(acc.username, acc.auth_token, acc.user_id, None, balance)
         
         await status_msg.edit_text(
@@ -421,23 +429,22 @@ class UltraFastBot:
         status_msg = await update.message.reply_text(
             f"🎫 *CLAIMING* `{coupon_code}`\n"
             f"├ 👥 Accounts: `{len(self.accounts)}`\n"
-            f"├ ⚡ Speed: ULTRA FAST\n"
-            f"└ ⏱️ Estimated: 3-5 seconds",
+            f"└ ⚡ Processing...",
             parse_mode='Markdown'
         )
         
         start_time = time.time()
         
         async with httpx.AsyncClient(proxy=PROXY_URL, verify=False, timeout=15.0) as client:
-            # Get balances BEFORE (parallel)
+            # Get balances BEFORE
             before_tasks = [acc.fast_balance(client) for acc in self.accounts]
             before_results = await asyncio.gather(*before_tasks)
             
-            # Claim coupons (parallel)
+            # Claim coupons
             claim_tasks = [acc.fast_claim(client, coupon_code) for acc in self.accounts]
             claim_results = await asyncio.gather(*claim_tasks)
             
-            # Get balances AFTER (parallel)
+            # Get balances AFTER
             after_tasks = [acc.fast_balance(client) for acc in self.accounts]
             after_results = await asyncio.gather(*after_tasks)
         
@@ -462,9 +469,15 @@ class UltraFastBot:
                 total_bonus += bonus
                 total_balance_before += before_balance
                 total_balance_after += after_balance
+                
+                # Save successful claim
+                self.db.save_coupon_claim(acc.username, coupon_code, "SUCCESS", bonus, before_balance, after_balance)
             else:
                 total_balance_before += before_balance
                 total_balance_after += before_balance
+                
+                # Save failed claim
+                self.db.save_coupon_claim(acc.username, coupon_code, "FAILED", 0, before_balance, before_balance)
             
             results.append({
                 'username': acc.username,
@@ -474,15 +487,7 @@ class UltraFastBot:
                 'before': before_balance,
                 'after': after_balance
             })
-            
-            # Save to database
-            self.db.save_coupon_claim(
-                acc.username, coupon_code,
-                "SUCCESS" if claim_success else "FAILED",
-                bonus, before_balance, after_balance
-            )
         
-        # Calculate total change
         total_change = total_balance_after - total_balance_before
         
         # Format response
@@ -492,26 +497,20 @@ class UltraFastBot:
         response += f"├ 💰 Bonus: `₹{total_bonus:.2f}`\n"
         response += f"└ 📈 Total Change: `₹{total_change:+.2f}`\n\n"
         
-        # Show top 10 results
+        # Show results (successful first)
+        results.sort(key=lambda x: x['success'], reverse=True)
+        
         response += "*DETAILS:*\n"
-        
-        # Sort by bonus (highest first)
-        results.sort(key=lambda x: x['bonus'], reverse=True)
-        
         for r in results[:15]:
             if r['success']:
                 change = r['after'] - r['before']
-                if r['bonus'] > 0:
-                    response += f"✅ *{r['username'][:15]}*: +₹{change:.0f} 💰\n"
-                else:
-                    response += f"✅ *{r['username'][:15]}*: ₹{r['after']:.0f}\n"
+                response += f"✅ *{r['username'][:15]}*: +₹{change:.0f}\n"
             else:
                 response += f"❌ *{r['username'][:15]}*: {r['message'][:20]}\n"
         
         if len(results) > 15:
             response += f"\n*... and {len(results)-15} more accounts*"
         
-        # Add summary
         response += f"\n📊 *SUMMARY*\n"
         response += f"├ 💰 Before: `₹{total_balance_before:.2f}`\n"
         response += f"├ 💰 After: `₹{total_balance_after:.2f}`\n"
@@ -530,11 +529,6 @@ class UltraFastBot:
             tasks = [acc.fast_balance(client) for acc in self.accounts]
             results = await asyncio.gather(*tasks)
         
-        # Update database
-        for acc, (success, balance) in zip(self.accounts, results):
-            if success:
-                self.db.update_account(acc.username, None, None, None, balance)
-        
         response = "💰 *ALL BALANCES*\n\n"
         total = 0
         online = 0
@@ -544,6 +538,7 @@ class UltraFastBot:
                 response += f"✅ *{acc.username}*: `₹{balance:.2f}`\n"
                 total += balance
                 online += 1
+                self.db.update_account(acc.username, None, None, None, balance)
             else:
                 response += f"❌ *{acc.username}*: `Offline`\n"
         
@@ -581,13 +576,11 @@ class UltraFastBot:
     async def show_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         stats = self.db.get_stats()
         
-        # Calculate average bonus
         avg_bonus = stats['total_bonus'] / stats['total_claims'] if stats['total_claims'] > 0 else 0
         
         response = f"📊 *BOT STATISTICS*\n\n"
         response += f"👥 *ACCOUNTS*\n"
-        response += f"├ Total: `{stats['total_accounts']}`\n"
-        response += f"└ Active: `{stats['total_accounts']}`\n\n"
+        response += f"├ Total: `{stats['total_accounts']}`\n\n"
         
         response += f"💰 *BALANCE*\n"
         response += f"└ Total: `₹{stats['total_balance']:.2f}`\n\n"
@@ -621,7 +614,6 @@ def main():
         print("❌ BOT_TOKEN not found!")
         return
     
-    # Print configuration
     print("\n" + "="*50)
     print("🚀 ULTRA-FAST CRICWAY BOT")
     print("="*50)
@@ -644,7 +636,7 @@ def main():
     app.add_handler(CommandHandler("remove", bot.remove_account))
     
     print("🚀 Bot is running...")
-    print("✅ Ready for ultra-fast coupon claiming!\n")
+    print("✅ Ready for coupon claiming!\n")
     
     app.run_polling()
 
