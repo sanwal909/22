@@ -67,6 +67,7 @@ class Database:
                 bonus REAL,
                 balance_before REAL,
                 balance_after REAL,
+                message TEXT,
                 proxy_ip TEXT,
                 claimed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -137,11 +138,11 @@ class Database:
             cursor.execute(f"UPDATE accounts SET {', '.join(updates)} WHERE username = ?", params)
             self.conn.commit()
     
-    def save_coupon_claim(self, username: str, coupon_code: str, status: str, bonus: float, balance_before: float, balance_after: float, proxy_ip: str = None):
+    def save_coupon_claim(self, username: str, coupon_code: str, status: str, bonus: float, balance_before: float, balance_after: float, message: str = "", proxy_ip: str = None):
         cursor = self.conn.cursor()
         cursor.execute(
-            "INSERT INTO coupon_history (username, coupon_code, status, bonus, balance_before, balance_after, proxy_ip) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (username, coupon_code, status, bonus, balance_before, balance_after, proxy_ip)
+            "INSERT INTO coupon_history (username, coupon_code, status, bonus, balance_before, balance_after, message, proxy_ip) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (username, coupon_code, status, bonus, balance_before, balance_after, message, proxy_ip)
         )
         self.conn.commit()
         
@@ -181,10 +182,18 @@ class FastCricwayAccount:
         self.base_url = "https://api.uvwin2024.co"
         self.headers = {
             'accept': 'application/json',
+            'accept-language': 'en-US,en;q=0.8',
             'content-type': 'application/json',
             'origin': 'https://www.cricway.io',
             'referer': 'https://www.cricway.io/',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Brave";v="146"',
+            'sec-ch-ua-mobile': '?1',
+            'sec-ch-ua-platform': '"Android"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'cross-site',
+            'sec-gpc': '1',
+            'user-agent': 'Mozilla/5.0 (Linux; Android 8.0.0; SM-G955U Build/R16NW) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36',
         }
         if self.auth_token:
             self.headers['authorization'] = self.auth_token
@@ -251,55 +260,49 @@ class FastCricwayAccount:
             return False, 0
     
     async def fast_claim(self, client: httpx.AsyncClient, coupon_code: str) -> Tuple[bool, str, float]:
-        """Fast coupon claim - FIXED ENDPOINT"""
+        """Fast coupon claim - CORRECT ENDPOINT"""
         if not self.auth_token:
             return False, "Not authenticated", 0
         
-        # Try different endpoints
-        endpoints = [
-            f'/marketing/v1/bonuses/apply',
-            f'/marketing/v1/bonuses/redeem',
-            f'/promotion/v1/coupons/redeem',
-            f'/coupon/v1/redeem',
-            f'/marketing/v1/coupons/{coupon_code}/redeem',
-            f'/bonus/v1/claim',
-        ]
+        params = {'coupon_code': coupon_code}
         
-        for endpoint in endpoints:
-            try:
-                if '{coupon_code}' in endpoint:
-                    url = f'{self.base_url}{endpoint.format(coupon_code=coupon_code)}'
-                    params = None
-                else:
-                    url = f'{self.base_url}{endpoint}'
-                    params = {'coupon_code': coupon_code}
+        try:
+            response = await client.get(
+                f'{self.base_url}/marketing/v1/bonuses/special-bonus',
+                headers=self.headers,
+                params=params,
+                timeout=10.0
+            )
+            
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    bonus = 0
+                    message = data.get('message', 'Success')
+                    
+                    if 'data' in data:
+                        bonus = data['data'].get('amount', data['data'].get('bonus', 0))
+                    
+                    print(f"✅ Claim success: {bonus}")
+                    return True, message, float(bonus)
+                except Exception as e:
+                    print(f"Claim parse error: {e}")
+                    return True, "Claimed", 0
+                    
+            elif response.status_code == 409:
+                try:
+                    data = response.json()
+                    message = data.get('message', 'Limit exhausted')
+                    print(f"❌ Limit exhausted: {message}")
+                    return False, message, 0
+                except:
+                    return False, "Limit exhausted", 0
+            else:
+                return False, f"HTTP {response.status_code}", 0
                 
-                response = await client.post(
-                    url,
-                    headers=self.headers,
-                    params=params,
-                    json={'couponCode': coupon_code, 'coupon_code': coupon_code},
-                    timeout=8.0
-                )
-                
-                if response.status_code == 200:
-                    try:
-                        data = response.json()
-                        bonus = 0
-                        if 'data' in data:
-                            bonus = data['data'].get('amount', data['data'].get('bonus', 0))
-                        elif 'amount' in data:
-                            bonus = data['amount']
-                        elif 'bonus' in data:
-                            bonus = data['bonus']
-                        return True, "Success", float(bonus)
-                    except:
-                        return True, "Claimed", 0
-                        
-            except Exception as e:
-                continue
-        
-        return False, "No working endpoint found", 0
+        except Exception as e:
+            print(f"Claim error: {e}")
+            return False, str(e), 0
 
 # ==================== ULTRA FAST BOT ====================
 class UltraFastBot:
@@ -337,7 +340,7 @@ class UltraFastBot:
 ⚡ *COMMANDS*
 ├ `/add user pass` - Add account
 ├ `/loginall` - Login all accounts
-├ `/claim CODE` - Claim coupon
+├ `/claim CODE` - Claim coupon (GET request)
 ├ `/balance` - Show all balances
 ├ `/check` - Check login status
 ├ `/stats` - View statistics
@@ -440,7 +443,7 @@ class UltraFastBot:
             before_tasks = [acc.fast_balance(client) for acc in self.accounts]
             before_results = await asyncio.gather(*before_tasks)
             
-            # Claim coupons
+            # Claim coupons (parallel)
             claim_tasks = [acc.fast_claim(client, coupon_code) for acc in self.accounts]
             claim_results = await asyncio.gather(*claim_tasks)
             
@@ -470,14 +473,12 @@ class UltraFastBot:
                 total_balance_before += before_balance
                 total_balance_after += after_balance
                 
-                # Save successful claim
-                self.db.save_coupon_claim(acc.username, coupon_code, "SUCCESS", bonus, before_balance, after_balance)
+                self.db.save_coupon_claim(acc.username, coupon_code, "SUCCESS", bonus, before_balance, after_balance, claim_msg)
             else:
                 total_balance_before += before_balance
                 total_balance_after += before_balance
                 
-                # Save failed claim
-                self.db.save_coupon_claim(acc.username, coupon_code, "FAILED", 0, before_balance, before_balance)
+                self.db.save_coupon_claim(acc.username, coupon_code, "FAILED", 0, before_balance, before_balance, claim_msg)
             
             results.append({
                 'username': acc.username,
@@ -497,16 +498,14 @@ class UltraFastBot:
         response += f"├ 💰 Bonus: `₹{total_bonus:.2f}`\n"
         response += f"└ 📈 Total Change: `₹{total_change:+.2f}`\n\n"
         
-        # Show results (successful first)
-        results.sort(key=lambda x: x['success'], reverse=True)
-        
+        # Show results
         response += "*DETAILS:*\n"
         for r in results[:15]:
             if r['success']:
                 change = r['after'] - r['before']
                 response += f"✅ *{r['username'][:15]}*: +₹{change:.0f}\n"
             else:
-                response += f"❌ *{r['username'][:15]}*: {r['message'][:20]}\n"
+                response += f"❌ *{r['username'][:15]}*: {r['message'][:30]}\n"
         
         if len(results) > 15:
             response += f"\n*... and {len(results)-15} more accounts*"
